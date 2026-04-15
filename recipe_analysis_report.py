@@ -299,6 +299,13 @@ def discover_schema(rows, headers):
         n_unique  = len(set(str(v) for v in non_null))
         col_info[h] = dict(numeric_frac=num_count/nn, n_unique=n_unique, nn=nn)
 
+    # --- FORCE Run column if explicitly present ---
+    run_col = None
+    for h in headers:
+        if _norm_hdr(h) == "run":
+            run_col = h
+            break
+
     # ââ time column: most monotonically-increasing numeric column
     #    whose name contains a time keyword ââ
     time_col = None
@@ -373,22 +380,22 @@ def discover_schema(rows, headers):
         sensor_cols.append(h)
 
     # ââ run column ââ
-    run_col = None
-    best_r = -1
-    for col in id_cols:
-        if col == time_col: continue
-        vals = [r.get(col) for r in rows if r.get(col) is not None]
-        sc = _score_run_candidate(vals)
-        if sc > best_r: best_r = sc; run_col = col
-    # fallback: check sensors that look like run/lot/batch integer IDs
-    # (e.g. a "Run" column with 109 unique integer IDs that slipped into
-    #  sensor_cols because its ID keyword check failed or unique count was high)
-    for col in sensor_cols:
-        vals = [r.get(col) for r in rows if r.get(col) is not None]
-        if not vals: continue
-        if not _looks_like_run_id(vals): continue
-        sc = _score_run_candidate(vals)
-        if sc > best_r: best_r = sc; run_col = col
+    if run_col is None:
+        best_r = -1
+        for col in id_cols:
+            if col == time_col: continue
+            vals = [r.get(col) for r in rows if r.get(col) is not None]
+            sc = _score_run_candidate(vals)
+            if sc > best_r: best_r = sc; run_col = col
+        # fallback: check sensors that look like run/lot/batch integer IDs
+        # (e.g. a "Run" column with 109 unique integer IDs that slipped into
+        #  sensor_cols because its ID keyword check failed or unique count was high)
+        for col in sensor_cols:
+            vals = [r.get(col) for r in rows if r.get(col) is not None]
+            if not vals: continue
+            if not _looks_like_run_id(vals): continue
+            sc = _score_run_candidate(vals)
+            if sc > best_r: best_r = sc; run_col = col
 
     # ââ group columns (tool/chamber constant per run, 2-5 unique values) ââ
     group_cols = []
