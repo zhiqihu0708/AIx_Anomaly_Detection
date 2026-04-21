@@ -376,6 +376,9 @@ def discover_schema(rows, headers):
     run_col = None
     best_r = -1
     for col in id_cols:
+        if col.lower() == "run": 
+            run_col = col
+            break
         if col == time_col: continue
         vals = [r.get(col) for r in rows if r.get(col) is not None]
         sc = _score_run_candidate(vals)
@@ -383,12 +386,13 @@ def discover_schema(rows, headers):
     # fallback: check sensors that look like run/lot/batch integer IDs
     # (e.g. a "Run" column with 109 unique integer IDs that slipped into
     #  sensor_cols because its ID keyword check failed or unique count was high)
-    for col in sensor_cols:
-        vals = [r.get(col) for r in rows if r.get(col) is not None]
-        if not vals: continue
-        if not _looks_like_run_id(vals): continue
-        sc = _score_run_candidate(vals)
-        if sc > best_r: best_r = sc; run_col = col
+    if not run_col:
+        for col in sensor_cols:
+            vals = [r.get(col) for r in rows if r.get(col) is not None]
+            if not vals: continue
+            if not _looks_like_run_id(vals): continue
+            sc = _score_run_candidate(vals)
+            if sc > best_r: best_r = sc; run_col = col
 
     # ââ group columns (tool/chamber constant per run, 2-5 unique values) ââ
     group_cols = []
