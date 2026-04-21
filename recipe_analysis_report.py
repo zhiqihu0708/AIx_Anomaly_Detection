@@ -1045,7 +1045,17 @@ def prepare_runs(rows, schema):
                 if ts is not None:
                     run_start_ts[rid] = ts
 
-    # ââ Pre-compute step-start timestamps per (run, step_seq) when no
+    step_elapsed_vals_sample = []
+    for r in rows[:500]:
+        v = _f(r.get(step_elapsed_col, "")) if step_elapsed_col else None
+        if v is not None:
+            step_elapsed_vals_sample.append(v)
+    step_elapsed_col_empty = (step_elapsed_col is not None and
+                              len(step_elapsed_vals_sample) == 0)
+    if step_elapsed_col_empty:
+        print(f"  {step_elapsed_col} is empty -- deriving step elapsed from timestamps")
+
+    # ââ Pre-compute step-start timestamps per (run, step_seq) when no usable
     #    step_elapsed_col exists.  This lets us derive _step_elapsed_s from
     #    wall-clock timestamps even when the dataset has no explicit column for it.
     #    Strategy: first pass over all rows grouped by run; within each run track
@@ -1054,7 +1064,9 @@ def prepare_runs(rows, schema):
     # ââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
     step_start_ts_map = {}   # (run_id, step_seq_val) -> wall-clock seconds
 
-    need_step_elapsed_from_ts = (step_elapsed_col is None) and (use_wall_clock or not time_col_empty)
+    need_step_elapsed_from_ts = ((step_elapsed_col is None) or step_elapsed_col_empty) and (
+        use_wall_clock or not time_col_empty
+    )
     _step_key_col = step_seq_col or step_num_col   # column that identifies the step
 
     if need_step_elapsed_from_ts and _step_key_col:
@@ -1130,7 +1142,8 @@ def prepare_runs(rows, schema):
         r["_elapsed_s"] = elapsed_s
 
         # step fields
-        rset = _f(r.get(step_elapsed_col, "")) if step_elapsed_col else None
+        rset = (_f(r.get(step_elapsed_col, ""))
+                if step_elapsed_col and not step_elapsed_col_empty else None)
         if rset is not None:
             r["_step_elapsed_s"] = rset * time_scale
         elif need_step_elapsed_from_ts and _step_key_col:
