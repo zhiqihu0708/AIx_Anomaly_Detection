@@ -70,13 +70,21 @@ ZSCORE_HEIGHT          = 520
 SKIP_STEPS             = {"-1", "0"}   # bookkeeping steps never scored
 MIN_STEP_ROWS          = 500
 MIN_RUNS_FOR_SCORE     = 5
-TOP_N_STEPS            = 3
+TOP_N_STEPS            = 7
 MIN_CV_FOR_CHART       = 0.005
 MIN_STD_FRAC_OF_RANGE  = 0.01
+MIN_RNG_FRAC_OF_MEAN   = 0.03  # run-means range must be >= 3% of step mean to show trend chart
 MIN_ACTIVE_FRAC        = 0.05
 ABORT_ROW_FRAC         = 0.75
 FLOW_MIN_RANGE_SCCM    = 10.0
+MFC_RAMP_RATE_SCCM_S   = 5.0   # sccm/s -- if median flow changes faster than this, it's a ramp
+MFC_RAMP_WINDOW_S      = 10.0  # seconds -- ramp window padding on each side
+MFC_OVERSHOOT_FRAC     = 0.20  # flag ramp rows where flow > sp_target * (1 + this fraction)
+SCORE_OUTLIER_RATIO    = 10.0  # if one sensor's max score is > this x median of others, segregate
 HIGHFLIER_IQR_MULT     = 3.0
+STEP_NOISE_RATIO       = 0.20  # within-run std / step range > this => noisy in that step
+STEP_INACTIVE_FRAC     = 0.015 # abs(median run-mean) / global max < this => inactive in that step
+STEP_NOISY_STEP_FRAC   = 0.80  # if sensor noisy/inactive in > this fraction of steps, exclude globally
 N_SENSORS_FOR_REAL     = 2
 STEP_ROWS_MIN_FRAC     = 0.80
 TREND_CHART_W          = 940
@@ -372,21 +380,33 @@ def discover_schema(rows, headers):
         # Rule 6: DEFAULT -- numeric column with meaningful variation â SENSOR
         sensor_cols.append(h)
 
-    # ââ run column ââ
+    # -- run column --
+    # Priority 1: explicit run-ID column names (Run, RunID, Run_ID, Run_Number ...)
+    #   Prefer columns whose normalised header exactly matches a known run-ID
+    #   keyword AND whose values pass the run/batch shape test.  This prevents
+    #   SUBSTRATE_ID (high cardinality, 1 row per wafer) from winning the scorer.
+    RUN_EXPLICIT_KW = {'run_id', 'runid', 'run_number', 'runnumber',
+                       'run_no', 'runno', 'run_seq', 'run'}
     run_col = None
-    best_r = -1
-    for col in id_cols:
-        if col.lower() == "run": 
-            run_col = col
-            break
+    best_r  = -1
+    for col in (id_cols + sensor_cols):
         if col == time_col: continue
+        hn = _norm_hdr(col)
+        if hn not in RUN_EXPLICIT_KW: continue
         vals = [r.get(col) for r in rows if r.get(col) is not None]
+        if not vals: continue
+        if not _looks_like_run_id(vals): continue
         sc = _score_run_candidate(vals)
         if sc > best_r: best_r = sc; run_col = col
-    # fallback: check sensors that look like run/lot/batch integer IDs
-    # (e.g. a "Run" column with 109 unique integer IDs that slipped into
-    #  sensor_cols because its ID keyword check failed or unique count was high)
-    if not run_col:
+
+    # Priority 2: generic scoring across all id_cols (original logic)
+    if run_col is None:
+        for col in id_cols:
+            if col == time_col: continue
+            vals = [r.get(col) for r in rows if r.get(col) is not None]
+            sc = _score_run_candidate(vals)
+            if sc > best_r: best_r = sc; run_col = col
+        # fallback: sensors that look like run/lot/batch integer IDs
         for col in sensor_cols:
             vals = [r.get(col) for r in rows if r.get(col) is not None]
             if not vals: continue
@@ -394,28 +414,134 @@ def discover_schema(rows, headers):
             sc = _score_run_candidate(vals)
             if sc > best_r: best_r = sc; run_col = col
 
-    # ââ group columns (tool/chamber constant per run, 2-5 unique values) ââ
+    # Priority 3: time-based run estimation
+    #   No explicit run column found -- detect run boundaries from RunStartTime
+    #   transitions (Option A) or from large gaps in the wall-clock timestamp
+    #   (Option B, last resort).
+    if run_col is None:
+        _hdr_lower = {h.lower().replace('_', '').replace(' ', ''): h
+                      for h in (list(rows[0].keys()) if rows else [])}
+        # Option A: RunStartTime changes signal a new run
+        _run_start_cand = None
+        for _c in ['runstarttime', 'starttime', 'run_start', 'start_time',
+                   'runstart', 'jobstarttime', 'processstart']:
+            if _c in _hdr_lower:
+                _run_start_cand = _hdr_lower[_c]; break
+        if _run_start_cand:
+            _lbl = {}; _cnt = 0; _prev = None
+            for r in rows:
+                rst = str(r.get(_run_start_cand) or '').strip()
+                if rst and rst != _prev:
+                    if rst not in _lbl:
+                        _cnt += 1; _lbl[rst] = _cnt
+                    _prev = rst
+            if _cnt >= 2:
+                _prev = None
+                for r in rows:
+                    rst = str(r.get(_run_start_cand) or '').strip()
+                    if rst: _prev = rst
+                    r['_est_run_id'] = str(_lbl.get(_prev or '', 1))
+                run_col = '_est_run_id'
+                print(f'  No run column found -- estimated {_cnt} runs '
+                      f'from {repr(_run_start_cand)} transitions')
+        # Option B: large gaps in the wall-clock timestamp column
+        if run_col is None:
+            _ts_cand = None
+            for _c in ['timestamp', 'ts', 'datetime', 'time']:
+                if _c in _hdr_lower:
+                    _ts_cand = _hdr_lower[_c]; break
+            if _ts_cand:
+                import datetime as _dtm
+                _tv = []
+                for r in rows:
+                    s = str(r.get(_ts_cand) or '').strip(); _p = None
+                    for fmt in ('%Y-%m-%dT%H:%M:%S.%f', '%Y-%m-%dT%H:%M:%S',
+                                '%Y/%m/%d %H:%M:%S.%f', '%Y-%m-%d %H:%M:%S.%f',
+                                '%Y/%m/%d %H:%M:%S', '%Y-%m-%d %H:%M:%S',
+                                '%m/%d/%Y %H:%M:%S', '%d/%m/%Y %H:%M:%S'):
+                        try: _p = _dtm.datetime.strptime(s, fmt).timestamp(); break
+                        except (ValueError, TypeError): continue
+                    _tv.append(_p)
+                _gaps = sorted(abs(_tv[i] - _tv[i-1])
+                               for i in range(1, len(_tv))
+                               if _tv[i] is not None and _tv[i-1] is not None
+                               and abs(_tv[i] - _tv[i-1]) > 0)
+                if _gaps:
+                    _thresh = max(60.0, _gaps[len(_gaps)//2] * 20)
+                    _rid = 1
+                    for i, r in enumerate(rows):
+                        if (i > 0 and _tv[i] is not None and _tv[i-1] is not None
+                                and (_tv[i] - _tv[i-1]) > _thresh):
+                            _rid += 1
+                        r['_est_run_id'] = str(_rid)
+                    if _rid >= 2:
+                        run_col = '_est_run_id'
+                        print(f'  No run column found -- estimated {_rid} runs '
+                              f'from timestamp gaps (threshold {_thresh:.0f}s)')
+
+    # -- group columns --
+    # ToolName-like columns need a DIFFERENT validation path from other id_cols.
+    # When the same run_id appears in two tools (e.g. run 107891 in both
+    # 5CAP12N28-Carme-DTC_CHA_3 and 5CAPN12N28-Carme-DTC_CHA_4), the standard
+    # "constant within run_id group" check FAILS because the merged run group
+    # contains rows from both tools.  ToolName is therefore never added to
+    # group_cols and tool_col falls back to a wrong column (e.g. UVANormalCount).
+    #
+    # Tool columns: validate by counting distinct run_ids owned by each tool.
+    # Other id_cols: keep the original constant-per-run check.
+    TOOL_NAME_KW = ['toolname', 'tool_name', 'equipmentname', 'equipment_name',
+                    'eqpname', 'eqp_name', 'chamber_name']
     group_cols = []
     if run_col:
         run_groups = defaultdict(list)
         for r in rows:
-            rk = str(r.get(run_col,"?"))
+            rk = str(r.get(run_col, '?'))
             run_groups[rk].append(r)
         n_runs = len(run_groups)
-        for col in id_cols:
-            if col == run_col: continue
-            if _has_kw(col, LABEL_KEYWORDS): continue
-            if not _has_kw(col, ID_KEYWORDS): continue
+
+        # ── Tool-name candidates ─────────────────────────────────────────────
+        # Skips constant-per-run check (would fail for cross-tool run_ids).
+        # Instead counts distinct run_ids per tool value.
+        _tool_cands = [c for c in id_cols
+                       if c != run_col
+                       and not _has_kw(c, LABEL_KEYWORDS)
+                       and _has_kw(c, TOOL_NAME_KW)]
+        for col in _tool_cands:
             vals = [r.get(col) for r in rows if r.get(col) is not None]
             n_unique = len(set(str(v) for v in vals))
-            if n_unique < 2 or n_unique > 5: continue
+            if n_unique < 2 or n_unique > 50: continue
+            # Count how many distinct run_ids each tool value has
+            runs_per_tool = defaultdict(set)
+            for r in rows:
+                tv = str(r.get(col, '') or '').strip()
+                rv = str(r.get(run_col, '') or '').strip()
+                if tv and rv:
+                    runs_per_tool[tv].add(rv)
+            if not runs_per_tool: continue
+            min_runs_tool = max(1, n_runs * 0.05)
+            if min(len(rids) for rids in runs_per_tool.values()) >= min_runs_tool:
+                group_cols.append(col)
+                runs_info = ', '.join(f'{t}: {len(r)} runs' for t, r in sorted(runs_per_tool.items()))
+                print(f'  Tool column detected: {col!r} ({n_unique} tools -- {runs_info})')
+
+        # ── Other id_col candidates ──────────────────────────────────────────
+        # Must be constant within each run_id group (original logic).
+        _other_cands = [c for c in id_cols
+                        if c != run_col
+                        and not _has_kw(c, LABEL_KEYWORDS)
+                        and not _has_kw(c, TOOL_NAME_KW)
+                        and _has_kw(c, ID_KEYWORDS)]
+        for col in _other_cands:
+            vals = [r.get(col) for r in rows if r.get(col) is not None]
+            n_unique = len(set(str(v) for v in vals))
+            if n_unique < 2 or n_unique > 10: continue
             constant = all(
-                len(set(str(r.get(col,"")) for r in rrows)) <= 1
+                len(set(str(r.get(col, '') or '') for r in rrows)) <= 1
                 for rrows in run_groups.values())
             if not constant: continue
             runs_per_grp = defaultdict(int)
             for rk, rrows in run_groups.items():
-                gv = str(rrows[0].get(col,"?"))
+                gv = str(rrows[0].get(col, '?'))
                 runs_per_grp[gv] += 1
             if min(runs_per_grp.values()) >= max(2, n_runs * 0.15):
                 group_cols.append(col)
@@ -507,70 +633,111 @@ def discover_schema(rows, headers):
     #         b is a local extremum. Threshold: >0.35 across all runs.
     #         useful_frac  = fraction of timesteps NOT at the modal value.
     #         Both conditions required to flag as noisy (avoids flat sensors).
-    # ââ Noise filter: exclude sensors with high within-step noise relative
-    #    to their TOTAL operating range across the whole recipe.
-    #
-    # Key insight: a NOISY sensor (e.g. RF_LowFreq_Forward_Power, EChuck_Current)
-    # fluctuates randomly within each step -- its within-step std is a large
-    # fraction of its full recipe range.
-    # A CLEAN sensor (e.g. Chamber_Pressure) may vary within a step but
-    # that within-step std is tiny compared to the full 0â5 Torr recipe range.
-    #
-    # Metric: median_within_step_std / global_range
-    # Threshold: if this ratio > 0.20 across all runs â noisy.
-    NOISE_TO_RANGE_THRESH = 0.13
+    # Per-step noise filter: for each (sensor, step) pair compute
+    #   noise_ratio  = median(within-run std) / step_range
+    #   inactive     = abs(median run-mean) / global_max < STEP_INACTIVE_FRAC
+    # A (sensor, step) is noisy if noise_ratio > STEP_NOISE_RATIO OR inactive.
+    # A sensor is excluded globally if noisy in > STEP_NOISY_STEP_FRAC of steps;
+    # otherwise it is only suppressed in the specific steps where it is noisy.
+    # The per-step exclusion set is stored in the schema for score_steps.
 
-    # Use step_seq_col first (most granular), else step_num_col
     _step_col_for_noise = step_seq_col or step_num_col
 
-    # Group rows by run (use all rows -- no sampling -- grouped by run)
     run_all_rows_map = defaultdict(list)
     for r in rows:
         rid = str(r.get(run_col, "")) if run_col else "ALL"
         run_all_rows_map[rid].append(r)
 
-    noisy_sensors = set()
+    # Global max per sensor (for inactive check)
+    sensor_global_max = {}
     for s in sensor_cols:
-        ratios = []
-        for rid, rrows_r in run_all_rows_map.items():
-            vals_all = [_f(r.get(s)) for r in rrows_r if _f(r.get(s)) is not None]
-            if len(vals_all) < 20:
-                continue
-            global_range = max(vals_all) - min(vals_all)
-            if global_range < 1e-6:
-                continue   # flat sensor -- skip
+        all_v = [_f(r.get(s)) for r in rows if _f(r.get(s)) is not None]
+        if all_v:
+            sensor_global_max[s] = max(abs(v) for v in all_v)
 
-            # per-step within-step std
-            by_step = defaultdict(list)
-            for r in rrows_r:
-                v  = _f(r.get(s))
-                sk = str(r.get(_step_col_for_noise, "ALL")).strip() if _step_col_for_noise else "ALL"
-                if v is not None:
-                    by_step[sk].append(v)
-
-            step_stds = []
-            for sk, svals in by_step.items():
+    # Per (sensor, step): collect (within-run std, run_mean, step_range) tuples
+    step_sensor_data = defaultdict(lambda: defaultdict(list))
+    for rid, rrows_r in run_all_rows_map.items():
+        by_step_vals = defaultdict(lambda: defaultdict(list))
+        for r in rrows_r:
+            sk = str(r.get(_step_col_for_noise, "ALL")).strip() if _step_col_for_noise else "ALL"
+            for s in sensor_cols:
+                sv = _f(r.get(s))
+                if sv is not None:
+                    by_step_vals[sk][s].append(sv)
+        for sk, s_dict in by_step_vals.items():
+            for s, svals in s_dict.items():
                 if len(svals) < 5:
                     continue
-                mn  = sum(svals) / len(svals)
-                std = math.sqrt(sum((v - mn) ** 2 for v in svals) / len(svals))
-                step_stds.append(std)
+                mn_s  = sum(svals) / len(svals)
+                std_s = math.sqrt(sum((v - mn_s) ** 2 for v in svals) / len(svals))
+                rng_s = max(svals) - min(svals)
+                # Second-half stats: skip the first half to avoid counting
+                # the initial ramp/settling transition as noise.
+                half  = max(1, len(svals) // 2)
+                sv2   = svals[half:]
+                n2    = len(sv2)
+                mn_s2 = sum(sv2) / n2
+                std_s2= math.sqrt(sum((v - mn_s2) ** 2 for v in sv2) / n2) if n2 > 1 else 0.0
+                rng_s2= max(sv2) - min(sv2)
+                # Spike fraction: proportion of stable values that are
+                # far from the stable median (catches impulse-noise sensors)
+                sv2_s = sorted(sv2)
+                med_s2 = sv2_s[n2 // 2]
+                spike_thresh = max(abs(med_s2) * 3, rng_s2 * 0.30, 1e-6)
+                spk_frac = sum(1 for v in sv2 if abs(v - med_s2) > spike_thresh) / n2
+                # Tuple: (full_std, full_mean, full_range,
+                #         stable_std, stable_mean, stable_range, stable_spike_frac)
+                step_sensor_data[sk][s].append(
+                    (std_s, mn_s, rng_s, std_s2, mn_s2, rng_s2, spk_frac))
 
-            if not step_stds:
+    noisy_sensor_steps = set()
+    step_noisy_count   = defaultdict(int)
+    step_total_count   = defaultdict(int)
+    all_scored_steps   = [sk for sk in step_sensor_data if sk not in ("-1", "0")]
+
+    for sk in all_scored_steps:
+        for s, run_tuples in step_sensor_data[sk].items():
+            if len(run_tuples) < 3:
                 continue
-            step_stds.sort()
-            median_std = step_stds[len(step_stds) // 2]
-            ratios.append(median_std / global_range)
+            step_total_count[s] += 1
+            g_max = sensor_global_max.get(s, 0.0)
 
-        if not ratios:
-            continue
-        ratios.sort()
-        median_ratio = ratios[len(ratios) // 2]
-        if median_ratio > NOISE_TO_RANGE_THRESH:
-            # Safety check: never exclude a sensor that has a matching SP
-            # column and is tracking it closely -- it may just have a small
-            # global range (e.g. held at 150Â°C Â±0.1Â°C) which makes the
-            # ratio look high even though the sensor is perfectly well-behaved.
+            # Use STABLE (second-half) statistics so sensors that ramp then
+            # settle are not falsely classified as noisy.
+            stab_stds  = sorted(t[3] for t in run_tuples)
+            stab_means = sorted(t[4] for t in run_tuples)
+            stab_rngs  = sorted(t[5] for t in run_tuples)
+            stab_spks  = sorted(t[6] for t in run_tuples)
+            med_stab_std  = stab_stds[len(stab_stds) // 2]
+            med_stab_mean = stab_means[len(stab_means) // 2]
+            med_stab_rng  = stab_rngs[len(stab_rngs) // 2]
+            med_stab_spk  = stab_spks[len(stab_spks) // 2]
+
+            # Criterion A: high RANDOM noise (std/range > threshold) in stable
+            # portion, confirmed by non-trivial spike fraction.
+            # Pure process ramps (heater going 14%->60%) have high std/range
+            # but zero spike fraction -- they are NOT noise and must be kept.
+            # Only flag Criterion A when spikes are also present, so genuine
+            # ramp steps are never misclassified as noisy.
+            _range_floor = max(abs(med_stab_mean) * 1e-3, 1e-6)
+            stab_nr = (med_stab_std / med_stab_rng
+                       if med_stab_rng > _range_floor else 0.0)
+            noisy_A = stab_nr > STEP_NOISE_RATIO and med_stab_spk > 0.01
+            # Criterion B: impulse/spike noise alone (even when std/range is low)
+            noisy_C = med_stab_spk > 0.05
+            # Criterion D: sensor inactive -- stable mean near-zero vs global max
+            noisy_B = (g_max > 1e-9 and abs(med_stab_mean) < STEP_INACTIVE_FRAC * g_max)
+
+            if noisy_A or noisy_B or noisy_C:
+                noisy_sensor_steps.add((s, sk))
+                step_noisy_count[s] += 1
+
+    noisy_sensors = set()
+    for s in sensor_cols:
+        total = step_total_count.get(s, 0)
+        noisy = step_noisy_count.get(s, 0)
+        if total >= 3 and noisy / total > STEP_NOISY_STEP_FRAC:
             sp_col_candidate = s + "_SP"
             if sp_col_candidate in (rows[0].keys() if rows else []):
                 sp_pcts = []
@@ -582,14 +749,49 @@ def discover_schema(rows, headers):
                             sp_pcts.append(abs(va - vs) / abs(vs))
                 if sp_pcts:
                     sp_pcts.sort()
-                    med_sp_pct = sp_pcts[len(sp_pcts) // 2]
-                    if med_sp_pct < 0.05:   # tracking SP within 5% â keep it
+                    if sp_pcts[len(sp_pcts) // 2] < 0.05:
                         continue
+            # Do not globally exclude a sensor that has at least one step
+            # where the STABLE portion passes all three noise checks:
+            #   - stable noise ratio (std/range) < STEP_NOISE_RATIO
+            #   - spike fraction < 5%
+            #   - sensor is not inactive (mean > STEP_INACTIVE_FRAC * global_max)
+            has_clean_stable_step = False
+            g_max_s = sensor_global_max.get(s, 0.0)
+            for sk2 in all_scored_steps:
+                if (s, sk2) in noisy_sensor_steps:
+                    continue
+                tups2 = step_sensor_data[sk2].get(s, [])
+                if len(tups2) < 3:
+                    continue
+                ss2   = sorted(t[3] for t in tups2)
+                sm2   = sorted(t[4] for t in tups2)
+                sr2   = sorted(t[5] for t in tups2)
+                spk2  = sorted(t[6] for t in tups2)
+                med_ss2  = ss2[len(ss2) // 2]
+                med_sm2  = sm2[len(sm2) // 2]
+                med_sr2  = sr2[len(sr2) // 2]
+                med_spk2 = spk2[len(spk2) // 2]
+                _rf2 = max(abs(med_sm2) * 1e-3, 1e-6)
+                nr2  = med_ss2 / med_sr2 if med_sr2 > _rf2 else 0.0
+                inact2 = g_max_s > 1e-9 and abs(med_sm2) < STEP_INACTIVE_FRAC * g_max_s
+                # Mirror the noisy_A criterion: high std/range is only noise when
+                # spikes are also present; ramps pass this check.
+                noisy_A2 = nr2 > STEP_NOISE_RATIO and med_spk2 > 0.01
+                noisy_C2 = med_spk2 > 0.05
+                if (not noisy_A2 and not noisy_C2 and med_sr2 > 1e-6 and not inact2):
+                    has_clean_stable_step = True
+                    break
+            if has_clean_stable_step:
+                continue
             noisy_sensors.add(s)
 
     if noisy_sensors:
-        print(f"  Noisy sensors excluded ({len(noisy_sensors)}): "
+        print(f"  Noisy sensors excluded globally ({len(noisy_sensors)}): "
               f"{sorted(noisy_sensors)[:8]}{'...' if len(noisy_sensors) > 8 else ''}")
+    n_step_excl = sum(1 for (s, _) in noisy_sensor_steps if s not in noisy_sensors)
+    if n_step_excl:
+        print(f"  Per-step noise exclusions (sensor noisy in specific steps only): {n_step_excl}")
 
     sensor_cols = [s for s in sensor_cols if s not in noisy_sensors]
 
@@ -649,11 +851,17 @@ def discover_schema(rows, headers):
         # Exclude validation/ratio prefixes -- not primary MFC flow readings
         if re.match(r'VS_', col, re.IGNORECASE):
             return None
-        # find the 'flow' word boundary
-        m = re.search(r'(?<![a-zA-Z0-9])flow(?![a-zA-Z0-9])', col, re.IGNORECASE)
+        # find the 'flow' word boundary -- also handles rFlow/fFlow MFC naming
+        # where a single lowercase r or f precedes "flow" (e.g. O2CLN_Mfc_rFlow)
+        m = re.search(r'(?<![a-zA-Z0-9])[rf]?flow(?![a-zA-Z0-9])', col, re.IGNORECASE)
         if m is None:
             return None
-        prefix = col[:m.start()].rstrip('_')
+        # Strip single leading r/f from the match to get the true prefix boundary
+        match_str = m.group(0)
+        flow_start = m.start()
+        if match_str[0].lower() in ('r', 'f') and len(match_str) > 4:
+            flow_start += 1  # skip the r/f prefix character
+        prefix = col[:flow_start].rstrip('_')
         if not re.search(r'mfc', prefix, re.IGNORECASE):
             return None
         return prefix   # e.g. "MFC_AR", "MFC_AR_CLN", "O2CLN_Mfc"
@@ -896,6 +1104,7 @@ def discover_schema(rows, headers):
         event_source_col= event_source_col,
         arc_count_cols       = arc_count_cols,
         rough_scoring_excl   = rough_scoring_excl,
+        noisy_sensor_steps   = noisy_sensor_steps,
     )
 
     print("\n  -- Schema Discovery --")
@@ -1045,17 +1254,7 @@ def prepare_runs(rows, schema):
                 if ts is not None:
                     run_start_ts[rid] = ts
 
-    step_elapsed_vals_sample = []
-    for r in rows[:500]:
-        v = _f(r.get(step_elapsed_col, "")) if step_elapsed_col else None
-        if v is not None:
-            step_elapsed_vals_sample.append(v)
-    step_elapsed_col_empty = (step_elapsed_col is not None and
-                              len(step_elapsed_vals_sample) == 0)
-    if step_elapsed_col_empty:
-        print(f"  {step_elapsed_col} is empty -- deriving step elapsed from timestamps")
-
-    # ââ Pre-compute step-start timestamps per (run, step_seq) when no usable
+    # ââ Pre-compute step-start timestamps per (run, step_seq) when no
     #    step_elapsed_col exists.  This lets us derive _step_elapsed_s from
     #    wall-clock timestamps even when the dataset has no explicit column for it.
     #    Strategy: first pass over all rows grouped by run; within each run track
@@ -1064,9 +1263,7 @@ def prepare_runs(rows, schema):
     # ââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
     step_start_ts_map = {}   # (run_id, step_seq_val) -> wall-clock seconds
 
-    need_step_elapsed_from_ts = ((step_elapsed_col is None) or step_elapsed_col_empty) and (
-        use_wall_clock or not time_col_empty
-    )
+    need_step_elapsed_from_ts = (step_elapsed_col is None) and (use_wall_clock or not time_col_empty)
     _step_key_col = step_seq_col or step_num_col   # column that identifies the step
 
     if need_step_elapsed_from_ts and _step_key_col:
@@ -1142,8 +1339,7 @@ def prepare_runs(rows, schema):
         r["_elapsed_s"] = elapsed_s
 
         # step fields
-        rset = (_f(r.get(step_elapsed_col, ""))
-                if step_elapsed_col and not step_elapsed_col_empty else None)
+        rset = _f(r.get(step_elapsed_col, "")) if step_elapsed_col else None
         if rset is not None:
             r["_step_elapsed_s"] = rset * time_scale
         elif need_step_elapsed_from_ts and _step_key_col:
@@ -1693,6 +1889,192 @@ def build_baseline(run_dict, sensor, exclude=None):
     return step_index, flat_keys, flat_meds, flat_mads
 
 
+# -- MFC ramp interval helpers -----------------------------------------------
+
+def _is_mfc_flow_sensor(sensor_name):
+    """Return True if this is an MFC flow sensor (ramps should be ignored)."""
+    sn = sensor_name.lower()
+    return 'mfc' in sn and 'flow' in sn
+
+
+def _find_sp_col(sensor, row_keys):
+    """Return the SP column name for an MFC flow sensor, or None.
+
+    Tries common conventions:
+      MFC_AR_CARRIER_Flow  -> MFC_AR_CARRIER_Flow_SP
+      MFC_AR_CARRIER_rFlow -> MFC_AR_CARRIER_Flow_SP  (strip leading r/f)
+      MFC_AR_CARRIER_fFlow -> MFC_AR_CARRIER_Flow_SP
+    Falls back to any column in row_keys whose name contains the same
+    gas-token prefix and both 'flow' and 'sp'.
+    """
+    key_set = set(row_keys)
+    # Direct _SP suffix
+    if sensor + "_SP" in key_set:
+        return sensor + "_SP"
+    # Strip leading r/f from the flow suffix (rFlow -> Flow_SP)
+    import re
+    m = re.search(r'[rf]flow', sensor, re.IGNORECASE)
+    if m:
+        base = sensor[:m.start()] + "Flow"
+        if base + "_SP" in key_set:
+            return base + "_SP"
+    # Fuzzy: same prefix, contains 'flow' and 'sp'
+    sn_lower = sensor.lower()
+    prefix = sn_lower[:max(sn_lower.rfind('flow'), 0)].rstrip('_r f'.split()[0])
+    for k in key_set:
+        kl = k.lower()
+        if prefix and kl.startswith(prefix) and 'flow' in kl and 'sp' in kl:
+            return k
+    return None
+
+
+def _build_mfc_ramp_intervals(run_dict, sensor, bin_s=1.0):
+    """
+    Return a list of (t_start, t_end, sp_col, sp_target) tuples where the
+    cross-run median of this MFC flow sensor is changing rapidly (a normal ramp).
+
+    sp_col     : name of the setpoint column for this flow sensor (or None)
+    sp_target  : median SP value just AFTER the ramp ends (the destination target)
+
+    During scoring, a row inside a ramp window is suppressed only when
+    the actual flow is within MFC_OVERSHOOT_FRAC of sp_target.  If the
+    flow significantly exceeds sp_target it is still scored as anomalous.
+    """
+    if not _is_mfc_flow_sensor(sensor):
+        return []
+
+    # Find the SP column from any row in run_dict
+    sp_col = None
+    for rrows in run_dict.values():
+        if rrows:
+            sp_col = _find_sp_col(sensor, rrows[0].keys())
+            break
+
+    # Bin cross-run medians into 1-second buckets
+    bin_vals    = defaultdict(list)
+    bin_sp_vals = defaultdict(list)
+    for rrows in run_dict.values():
+        for r in rrows:
+            t = r.get("_elapsed_s")
+            v = _f(r.get(sensor))
+            if t is not None and v is not None:
+                b = round(t / bin_s) * bin_s
+                bin_vals[b].append(v)
+            if sp_col:
+                vs = _f(r.get(sp_col))
+                if t is not None and vs is not None:
+                    bin_sp_vals[round(t / bin_s) * bin_s].append(vs)
+
+    if not bin_vals:
+        return []
+
+    times   = sorted(bin_vals)
+    medians = [_median(bin_vals[t]) for t in times]
+
+    # Detect bins where the cross-run median changes faster than the threshold
+    ramp_bins = set()
+    for i in range(1, len(times)):
+        dt = times[i] - times[i - 1]
+        if dt <= 0:
+            continue
+        rate = abs(medians[i] - medians[i - 1]) / dt
+        if rate > MFC_RAMP_RATE_SCCM_S:
+            ramp_bins.add(times[i - 1])
+            ramp_bins.add(times[i])
+
+    if not ramp_bins:
+        return []
+
+    # Expand ramp bins with padding and merge overlaps
+    raw = [(bt - MFC_RAMP_WINDOW_S, bt + MFC_RAMP_WINDOW_S)
+           for bt in sorted(ramp_bins)]
+    merged = []
+    for start, end in sorted(raw):
+        if merged and start <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([start, end])
+
+    # For each merged interval compute the SP target (the destination the ramp
+    # is heading towards).  Strategy:
+    #   1. SP column post-ramp: median SP in a 5-second window after interval
+    #   2. SP column during ramp: median SP inside the interval (SP changes
+    #      immediately to the new target even while flow is still ramping)
+    #   3. Fallback: median flow after the ramp ends
+    # The sp_target drives the overshoot check: flow > sp_target*(1+tol) = anomaly.
+    result = []
+    POST_WIN = 5.0
+    for start, end in merged:
+        post_bins   = [t for t in times if end          < t <= end + POST_WIN]
+        during_bins = [t for t in times if start        <= t <= end           ]
+
+        sp_target = None
+        if sp_col:
+            # Try post-ramp SP first
+            sp_post = [v for b in post_bins   for v in bin_sp_vals.get(b, [])]
+            sp_target = _median(sp_post) if sp_post else None
+            # Try during-ramp SP if post-ramp is missing or zero
+            if sp_target is None or sp_target == 0.0:
+                sp_dur = [v for b in during_bins for v in bin_sp_vals.get(b, [])]
+                sp_dur_med = _median(sp_dur) if sp_dur else None
+                if sp_dur_med is not None and sp_dur_med != 0.0:
+                    sp_target = sp_dur_med
+
+        if sp_target is None or sp_target == 0.0:
+            # Flow-based fallback: median flow after the ramp
+            flow_post = [v for b in post_bins for v in bin_vals.get(b, [])]
+            fp_med    = _median(flow_post) if flow_post else None
+            if fp_med is not None:
+                sp_target = fp_med   # may be 0 for ramp-to-zero -- that's correct
+
+        result.append((start, end, sp_col, sp_target))
+
+    return result
+
+
+def _in_ramp_interval(t, intervals):
+    """Return True if t falls within any ramp interval AND the caller should
+    suppress this point (i.e. it is a plain ramp with no overshoot).
+
+    intervals items are (t_start, t_end, sp_col, sp_target) -- the sp fields
+    are used by _ramp_should_suppress; this function just checks membership.
+    """
+    for entry in intervals:
+        t_start, t_end = entry[0], entry[1]
+        if t_start <= t <= t_end:
+            return True
+    return False
+
+
+def _ramp_should_suppress(t, v, intervals):
+    """Return True if point (t, v) is inside a ramp window AND the flow value
+    is within the normal ramp range (i.e. does not overshoot the SP target).
+
+    Suppression rule:
+      - t must be inside a ramp interval
+      - If sp_target is unknown: suppress conservatively (old blanket behaviour)
+      - If sp_target is known:
+          suppress  when  v  <=  sp_target + tol      (tracking SP, normal ramp)
+          keep scoring when  v  >  sp_target + tol      (overshoots SP, real anomaly)
+        where tol = MFC_OVERSHOOT_FRAC * max(abs(sp_target), FLOW_MIN_RANGE_SCCM)
+        Using FLOW_MIN_RANGE_SCCM as the floor for tol ensures that even a
+        ramp-to-zero (sp_target=0) requires a meaningful overshoot before flagging.
+    """
+    for entry in intervals:
+        t_start, t_end, sp_col, sp_target = entry
+        if not (t_start <= t <= t_end):
+            continue
+        if sp_target is None:
+            return True   # no SP info -- suppress conservatively
+        tol   = max(MFC_OVERSHOOT_FRAC * abs(sp_target), FLOW_MIN_RANGE_SCCM)
+        upper = sp_target + tol
+        if v <= upper:
+            return True   # within normal ramp range -- suppress
+        return False      # significant overshoot above SP -- keep as anomaly
+    return False
+
+
+
 # ââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 # 4. ANOMALY DETECTION  (proven logic from old script)
 # ââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
@@ -1714,10 +2096,11 @@ def _bl_lookup(step_index, sn, se, BIN=0.5):
     return entry["medians"][idx], entry["mads"][idx]
 
 
-def compute_run_score(rrows, baseline, sensor):
-    """exceedance-fraction Ã mean-excess-z for one sensor.
+def compute_run_score(rrows, baseline, sensor, step_filter=None, ramp_intervals=None):
+    """exceedance-fraction x mean-excess-z for one sensor.
     Uses per-step baseline lookup -- never crosses step boundaries.
     baseline is the step_index dict returned by build_baseline.
+    ramp_intervals: optional list of (t_start, t_end) to skip (MFC ramp windows).
     """
     step_index = baseline[0] if isinstance(baseline, (tuple, list)) else baseline
     if not step_index:
@@ -1729,6 +2112,12 @@ def compute_run_score(rrows, baseline, sensor):
         sn = r.get("_step_number", "")
         if v is None or se is None or sn == "":
             continue
+        if step_filter is not None and sn not in step_filter:
+            continue
+        # Skip MFC ramp windows unless the flow overshoots the SP target
+        t_elapsed = r.get("_elapsed_s", 0) or 0
+        if ramp_intervals and _ramp_should_suppress(t_elapsed, v, ramp_intervals):
+            continue
         med, mad = _bl_lookup(step_index, sn, se)
         if med is None:
             continue
@@ -1738,8 +2127,6 @@ def compute_run_score(rrows, baseline, sensor):
     exceed = [z for z in z_vals if z > SENSOR_DIVERGE_SIGMA]
     frac   = len(exceed) / len(z_vals)
     return frac * _mean(exceed) if exceed else 0.0
-
-
 def flag_anomalous(run_composite_scores):
     """
     Adaptive threshold: median + OUTLIER_RUN_ZSCORE * max(MAD, floor).
@@ -1810,7 +2197,7 @@ def flag_anomalous(run_composite_scores):
 # 5. LEAD / LAG DETECTION  (ported exactly from old script)
 # ââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 
-def find_divergence_time(rrows, baseline, sensor):
+def find_divergence_time(rrows, baseline, sensor, ramp_intervals=None):
     """
     First recipe-elapsed time (seconds) at which the sensor sustains
     MIN_CONSEC_DIVERGE consecutive points above SENSOR_DIVERGE_SIGMA,
@@ -1820,6 +2207,8 @@ def find_divergence_time(rrows, baseline, sensor):
     spikes that occur in ALL runs (e.g. TV briefly hitting 90 during
     initial pump-down before settling).  Only sustained deviations that
     persist beyond the normal transient are flagged.
+
+    ramp_intervals: optional list of (t_start, t_end) to skip (MFC ramp windows).
 
     Returns recipe_elapsed_s or None.
     """
@@ -1834,6 +2223,10 @@ def find_divergence_time(rrows, baseline, sensor):
         sn = r.get("_step_number", "")
         if v is None or se is None or sn == "":
             continue
+        # Skip MFC ramp windows unless the flow overshoots the SP target
+        t_elapsed = r.get("_elapsed_s", 0) or 0
+        if ramp_intervals and _ramp_should_suppress(t_elapsed, v, ramp_intervals):
+            continue
         med, mad = _bl_lookup(step_index, sn, se)
         if med is None:
             continue
@@ -1844,7 +2237,7 @@ def find_divergence_time(rrows, baseline, sensor):
     if not t_vals:
         return None
 
-    # Smooth: replace each z with the median of a Â±2s window
+    # Smooth: replace each z with the median of a +/-2s window
     SMOOTH_WIN = 2.0
     smoothed = []
     for i, t in enumerate(t_vals):
@@ -1863,7 +2256,7 @@ def find_divergence_time(rrows, baseline, sensor):
     return None
 
 
-def detect_lead_lag(rrows, baselines, sensor_list):
+def detect_lead_lag(rrows, baselines, sensor_list, mfc_ramp_ivs=None):
     """
     Returns (lead_sensor, [(sensor, diverge_t), ...], [non_diverged...]).
     Sensors ordered by first-divergence time.
@@ -1872,6 +2265,9 @@ def detect_lead_lag(rrows, baselines, sensor_list):
     (elapsed_s > 1.0) to avoid false positives from different initial states
     between recipe variants.  The 2-second rolling-median smoothing in
     find_divergence_time additionally suppresses transient spikes.
+
+    mfc_ramp_ivs: optional dict {sensor: [(t0,t1),...]} of MFC ramp intervals
+    to skip during divergence detection.
     """
     # Only analyse rows from the step that triggered alarms -- determined by
     # finding the alarm step number in the run's rows.  Fall back to the
@@ -1904,7 +2300,8 @@ def detect_lead_lag(rrows, baselines, sensor_list):
     for s in sensor_list:
         bl = baselines.get(s)
         if bl and bl[0]:
-            t = find_divergence_time(active_rrows, bl, s)
+            ivs = (mfc_ramp_ivs or {}).get(s)
+            t = find_divergence_time(active_rrows, bl, s, ramp_intervals=ivs)
             if t is not None:
                 div[s] = t
     if not div:
@@ -1936,6 +2333,39 @@ def detect_lead_lag(rrows, baselines, sensor_list):
     lead    = chain[0][0]
     non_div = [s for s in sensor_list if s not in div]
     return lead, chain, non_div
+
+
+
+def _segregate_outlier_sensors(per_sensor_sc):
+    """
+    If a single sensor dominates scores (max score > SCORE_OUTLIER_RATIO x median
+    of other sensors), return the set of such sensors so they can be scored
+    independently to avoid distorting the composite threshold.
+
+    Returns a set of sensor names to be segregated (may be empty).
+    """
+    # per_sensor_sc: {run_id: {sensor: score}}
+    sensor_max = defaultdict(float)
+    for rid, s_dict in per_sensor_sc.items():
+        for s, sc in s_dict.items():
+            sensor_max[s] = max(sensor_max[s], sc)
+
+    if len(sensor_max) < 2:
+        return set()
+
+    segregated = set()
+    for s, max_sc in sensor_max.items():
+        # Compute median of OTHER sensors max scores
+        others = sorted(sc for ss, sc in sensor_max.items() if ss != s)
+        if not others:
+            continue
+        others_median = others[len(others) // 2]
+        if others_median < 1e-6:
+            continue
+        if max_sc > SCORE_OUTLIER_RATIO * others_median and max_sc > 50.0:
+            segregated.add(s)
+
+    return segregated
 
 
 def classify_alarm_relevance(alarm, lead_sensor, chain_sensors):
@@ -2061,30 +2491,44 @@ def z_trace(rrows, baseline, sensor):
 # SECTION 5  --  STEP IMPORTANCE, HIGHFLIERS & CORRELATION
 # ══════════════════════════════════════════════════════════════════════════════
 
-def detect_aborted_runs(rows, run_col):
+def detect_aborted_runs(tool_runs):
     """
-    Returns a set of run IDs whose row count is < ABORT_ROW_FRAC Ã median.
-    Only applied when there are >= 10 runs (meaningless for tiny datasets).
+    Tool-aware abort detection.
+
+    Operates on the already-split tool_runs dict {tool_id: {run_id: [rows]}}
+    so that runs shared across tools are evaluated independently per tool
+    (uses each tool's own row count, not a cross-tool merged count).
+
+    Returns:
+      aborted    : set of (tool_id, run_id) tuples  -- composite keys
+      row_counts : {(tool_id, run_id): int}          -- composite keys
     """
-    row_counts = defaultdict(int)
-    run_order  = []; seen = set()
-    for row in rows:
-        rid = str(row.get(run_col, '') or '').strip()
-        if not rid: continue
-        if rid not in seen:
-            seen.add(rid); run_order.append(rid)
-        row_counts[rid] += 1
+    row_counts: dict = {}
+    aborted:    set  = set()
 
-    if len(row_counts) < 10:
-        return set(), row_counts
+    for tool_id, rdict in tool_runs.items():
+        if not rdict:
+            continue
+        tool_cnts = {rid: len(rrows) for rid, rrows in rdict.items()}
+        for rid, cnt in tool_cnts.items():
+            row_counts[(tool_id, rid)] = cnt
 
-    counts = sorted(row_counts.values())
-    median_rows  = counts[len(counts)//2]
-    abort_thresh = median_rows * ABORT_ROW_FRAC
-    aborted = {rid for rid, cnt in row_counts.items() if cnt < abort_thresh}
-    if aborted:
-        print(f'  Aborted runs (rows < {abort_thresh:.0f}, median={median_rows}): '
-              f'{sorted(aborted)}')
+        if len(tool_cnts) < 10:
+            continue   # too few runs for abort detection to be meaningful
+
+        counts_sorted = sorted(tool_cnts.values())
+        median_rows   = counts_sorted[len(counts_sorted) // 2]
+        abort_thresh  = median_rows * ABORT_ROW_FRAC
+
+        tool_aborted = {(tool_id, rid)
+                        for rid, cnt in tool_cnts.items()
+                        if cnt < abort_thresh}
+        if tool_aborted:
+            print(f'  Aborted runs for tool {tool_id} '
+                  f'(rows < {abort_thresh:.0f}, median={median_rows}): '
+                  f'{sorted(rid for _, rid in tool_aborted)}')
+        aborted |= tool_aborted
+
     return aborted, row_counts
 
 
@@ -2201,14 +2645,16 @@ def detect_highfliers(run_means_by_step, run_order,
             lo = med - HIGHFLIER_IQR_MULT * iqr
             hi = med + HIGHFLIER_IQR_MULT * iqr
 
-            flagged = {rid: v for rid, v in rm_sensor.items() if v < lo or v > hi}
+            flagged = {ckey: v for ckey, v in rm_sensor.items() if v < lo or v > hi}
             if not flagged:
                 continue
 
             highfliers[sn][s] = {}
-            for rid, v in flagged.items():
-                rs        = run_signals.get(rid, {})
-                idx       = run_order.index(rid) if rid in run_order else -1
+            for ckey, v in flagged.items():
+                # ckey may be "tool::rid" -- extract bare rid for run_signals lookup
+                bare_rid  = ckey.split("::", 1)[1] if "::" in ckey else ckey
+                rs        = run_signals.get(bare_rid, {})
+                idx       = run_order.index(ckey) if ckey in run_order else -1
                 prev_flag = idx > 0 and run_order[idx - 1] in flagged
                 next_flag = (idx >= 0 and idx < len(run_order) - 1
                              and run_order[idx + 1] in flagged)
@@ -2216,8 +2662,9 @@ def detect_highfliers(run_means_by_step, run_order,
                 step_rows     = rs.get('step_row_count', {}).get(sn, 0)
                 step_truncated = (med_step_rows > 0
                                   and step_rows < med_step_rows * STEP_ROWS_MIN_FRAC)
-                dq_val = run_dq.get(rid)
-                highfliers[sn][s][rid] = dict(
+                dq_val = run_dq.get(bare_rid)
+                rid = ckey   # keep composite key for dict storage
+                highfliers[sn][s][ckey] = dict(
                     value          = v,
                     direction      = 'HIGH' if v > hi else 'LOW',
                     dq_value       = dq_val,
@@ -2294,17 +2741,31 @@ def compute_correlations(rm_step, exclude_runs):
 
     Returns (sensors, corr_matrix) where corr_matrix[i][j] is the Pearson r
     between sensor i and sensor j.  Returns ([], []) if < 3 usable runs.
+
+    Sensors that have no data at all for the non-excluded runs are dropped
+    before computing the intersection so that tool-specific missing sensors
+    (e.g. a column that is always null for one tool) do not zero out the
+    common-run set for that tool.
     """
-    # collect sensors that have data, sorted by name
-    sensors = sorted(rm_step.keys())
+    # Collect sensors that have at least one non-excluded run
+    all_sensors = sorted(rm_step.keys())
+    if len(all_sensors) < 2:
+        return [], []
+
+    # First pass: find which runs are available after exclusion, per sensor
+    sensor_runs = {s: set(rm_step[s].keys()) - exclude_runs for s in all_sensors}
+
+    # Drop sensors that have zero non-excluded runs for this tool subset --
+    # these are columns missing entirely for the target tool and would make
+    # the intersection empty, hiding all correlations for that tool.
+    sensors = [s for s in all_sensors if len(sensor_runs[s]) >= 3]
     if len(sensors) < 2:
         return [], []
 
-    # find runs present in ALL sensors and not excluded
-    run_sets = [set(rm_step[s].keys()) - exclude_runs for s in sensors]
-    common   = run_sets[0]
-    for rs in run_sets[1:]:
-        common &= rs
+    # find runs present in ALL remaining sensors and not excluded
+    common = sensor_runs[sensors[0]]
+    for s in sensors[1:]:
+        common &= sensor_runs[s]
     runs = sorted(common)
     if len(runs) < 3:
         return [], []
@@ -2324,8 +2785,19 @@ def compute_correlations(rm_step, exclude_runs):
     corr = [[_pearson(values[i], values[j]) for j in range(ns)] for i in range(ns)]
     return sensors, corr
 
-def score_steps(rows, run_col, tool_col, step_col, sensor_cols, aborted_runs):
-    """Score steps by cross-run CV, excluding aborted runs."""
+def score_steps(rows, run_col, tool_col, step_col, sensor_cols, aborted_runs,
+                noisy_sensor_steps=None):
+    """Score steps by cross-run CV, excluding aborted runs.
+
+    Uses composite key  tool + '::' + rid  so that the same run ID appearing
+    on multiple tools is tracked independently.  run_order and run_tool use
+    these composite keys; callers receive them and pass them on to
+    collect_run_means / svg_trend_chart unchanged.
+
+    noisy_sensor_steps: set of (sensor, step_key) pairs to exclude from
+      scoring.  Populated by filter_sensor_cols from the per-step noise analysis.
+    """
+    noisy_sensor_steps = noisy_sensor_steps or set()
     accum           = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
     step_row_counts = defaultdict(int)
     step_names      = {}
@@ -2344,9 +2816,11 @@ def score_steps(rows, run_col, tool_col, step_col, sensor_cols, aborted_runs):
         tool = str(row.get(tool_col, '') or 'ALL').strip() if tool_col else 'ALL'
         if not rid or not sn or sn in SKIP_STEPS:
             continue
-        if rid not in seen_runs:
-            seen_runs.add(rid); run_order.append(rid)
-            run_tool[rid] = tool
+        # Composite key: tool::rid so same run ID on different tools is distinct
+        ckey = f"{tool}::{rid}"
+        if ckey not in seen_runs:
+            seen_runs.add(ckey); run_order.append(ckey)
+            run_tool[ckey] = tool
         if rid in aborted_runs:
             continue    # exclude aborted runs from all step scoring
         step_row_counts[sn] += 1
@@ -2356,7 +2830,7 @@ def score_steps(rows, run_col, tool_col, step_col, sensor_cols, aborted_runs):
         for s in sensor_cols:
             v = _f(row.get(s))
             if v is not None:
-                accum[sn][s][rid].append(v)
+                accum[sn][s][ckey].append(v)
 
     # Global min/max per sensor across all steps (active-step filter)
     global_sensor_min = {}; global_sensor_max = {}
@@ -2374,6 +2848,9 @@ def score_steps(rows, run_col, tool_col, step_col, sensor_cols, aborted_runs):
             continue
         sensor_cvs = []
         for s, run_dict in sens_dict.items():
+            # Skip (sensor, step) pairs identified as noisy in filter_sensor_cols
+            if (s, sn) in noisy_sensor_steps:
+                continue
             run_means = [sum(v)/len(v) for v in run_dict.values() if v]
             if len(run_means) < MIN_RUNS_FOR_SCORE:
                 continue
@@ -2388,13 +2865,43 @@ def score_steps(rows, run_col, tool_col, step_col, sensor_cols, aborted_runs):
             g_hi  = global_sensor_max.get(s, mn)
             g_rng = max(g_hi - g_lo, 1e-12)
 
-            if std < g_rng * MIN_STD_FRAC_OF_RANGE:
+            # Use the step-level range of run-means (rng) as the reference for
+            # the minimum-std check.  Using the global sensor range (g_rng) is
+            # too strict for sensors whose step-level variation is meaningful but
+            # small relative to their full operating range across all steps
+            # (e.g. Pedestal heater varies 0.5% at Dep but spans 5–60% globally).
+            step_rng = max(rng, 1e-12)
+            if std < step_rng * MIN_STD_FRAC_OF_RANGE:
                 continue
+            # Skip sensors whose run-means band is too tight to be visually
+            # meaningful -- the full spread of run means must be >= 3% of the
+            # step mean.  This excludes mechanically-locked sensors (e.g.
+            # Pedestal lift position always within 1.86 mm of 84 mm = 2.2%).
+            if abs(mn) > 1e-9 and rng < MIN_RNG_FRAC_OF_MEAN * abs(mn):
+                continue
+            # Skip sensors whose mean is at/near the inactive minimum.
+            # For sensors that never reach zero (always-negative), skip this
+            # check as they are always "active" from a process perspective.
             active_threshold = g_lo + g_rng * MIN_ACTIVE_FRAC
-            if mn < active_threshold:
+            if g_lo >= 0 and mn < active_threshold:
                 continue
-            if cv >= MIN_CV_FOR_CHART:
-                sensor_cvs.append((s, cv, mn, std, rng))
+            elif g_lo < 0 and g_hi < 0:
+                pass  # always-negative sensor: always active, skip the check
+            elif mn < active_threshold:
+                continue
+            # Late-shift detection: boost CV if sensor shows a significant
+            # trend shift between the first and last third of runs.
+            run_means_sorted = list(run_means)
+            n_early = max(1, len(run_means_sorted) // 3)
+            n_late  = max(1, len(run_means_sorted) // 3)
+            early_mean = sum(run_means_sorted[:n_early]) / n_early
+            late_mean  = sum(run_means_sorted[-n_late:]) / n_late
+            shift_magnitude = abs(late_mean - early_mean)
+            shift_score = shift_magnitude / std if std > 0 else 0.0
+            # Boost effective CV if there is a late-run shift
+            effective_cv = max(cv, cv * (1 + shift_score * 0.5))
+            if effective_cv >= MIN_CV_FOR_CHART:
+                sensor_cvs.append((s, effective_cv, mn, std, rng))
 
         if not sensor_cvs:
             continue
@@ -2413,23 +2920,30 @@ def score_steps(rows, run_col, tool_col, step_col, sensor_cols, aborted_runs):
 
 
 # ââ per-run means for trend charts âââââââââââââââââââââââââââââââââââââââââââ
-def collect_run_means(rows, run_col, step_col, sensors, target_steps, aborted_runs):
-    """Returns { step: { sensor: { run_id: mean_value } } } -- aborted excluded."""
+def collect_run_means(rows, run_col, step_col, sensors, target_steps, aborted_runs,
+                      tool_col=None):
+    """Returns { step: { sensor: { tool::rid: mean_value } } } -- aborted excluded.
+
+    Uses the same tool::rid composite key as score_steps so that shared run IDs
+    across multiple tools are tracked independently in trend charts.
+    """
     accum = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
     for row in rows:
-        rid = str(row.get(run_col, '') or '').strip()
-        sn  = str(row.get(step_col, '') or '').strip()
+        rid  = str(row.get(run_col,  '') or '').strip()
+        sn   = str(row.get(step_col, '') or '').strip()
+        tool = str(row.get(tool_col, '') or 'ALL').strip() if tool_col else 'ALL'
         if not rid or rid in aborted_runs or sn not in target_steps:
             continue
+        ckey = f"{tool}::{rid}"
         for s in sensors:
             v = _f(row.get(s))
             if v is not None:
-                accum[sn][s][rid].append(v)
+                accum[sn][s][ckey].append(v)
     result = {}
     for sn, sd in accum.items():
         result[sn] = {}
         for s, rd in sd.items():
-            result[sn][s] = {rid: sum(v)/len(v) for rid, v in rd.items() if v}
+            result[sn][s] = {ckey: sum(v)/len(v) for ckey, v in rd.items() if v}
     return result
 
 
@@ -2487,7 +3001,7 @@ def _nice_interval(t_range, max_ticks=12):
 # ââ A. Raw sensor trace overlay âââââââââââââââââââââââââââââââââââââââââââââââ
 def svg_raw_trace(sensor, tool_id, run_dict, step_info,
                   looped_per_run, run_colors, anomalous_runs,
-                  alarm_info=None):
+                  alarm_info=None, aborted_runs=None):
     """
     All runs overlaid for one sensor with:
     - Shaded envelope (min/max of normal runs) as a green band
@@ -2534,8 +3048,10 @@ def svg_raw_trace(sensor, tool_id, run_dict, step_info,
     pw = W - mg["left"] - mg["right"]
     ph = H - mg["top"]  - mg["bottom"]
 
+    # Setup aborted run set and normal_ids (aborted excluded from envelope)
+    _aborted_set = aborted_runs or set()
     # value range -- from normal runs only (so anomalous run sticks out visually)
-    normal_ids = [r for r in traces if r not in anomalous_runs]
+    normal_ids = [r for r in traces if r not in anomalous_runs and r not in _aborted_set]
     if normal_ids:
         norm_vs = [v for rid in normal_ids for v in traces[rid][1]]
     else:
@@ -2624,7 +3140,7 @@ def svg_raw_trace(sensor, tool_id, run_dict, step_info,
 
     # ââ normal run traces (thin, semi-transparent) ââ
     for rid in sorted(traces):
-        if rid in anomalous_runs:
+        if rid in anomalous_runs or rid in _aborted_set:
             continue
         ts, vs = traces[rid]
         col  = run_colors.get(rid, "#777")
@@ -2632,7 +3148,17 @@ def svg_raw_trace(sensor, tool_id, run_dict, step_info,
         svg.append(f'<polyline points="{pts}" fill="none" '
                    f'stroke="{col}" stroke-width="1.8" opacity="0.65"/>')
 
-    # ââ anomalous run traces (thick, bright red, on top) ââ
+    # aborted run traces (orange, medium weight)
+    if _aborted_set:
+        for rid in sorted(_aborted_set):
+            if rid not in traces:
+                continue
+            ts, vs = traces[rid]
+            pts = " ".join(f"{tx(t):.1f},{ty(v):.1f}" for t, v in zip(ts, vs))
+            svg.append(f'<polyline points="{pts}" fill="none" '
+                       f'stroke="#FF6D00" stroke-width="2" opacity="0.75"/>')
+
+    # anomalous run traces (thick, bright red, on top)
     for rid in sorted(anomalous_runs):
         if rid not in traces:
             continue
@@ -2733,9 +3259,14 @@ def svg_raw_trace(sensor, tool_id, run_dict, step_info,
     row_off = 24
 
     # normal runs
-    for ri, rid in enumerate(sorted(r for r in traces if r not in anomalous_runs)):
+    for ri, rid in enumerate(sorted(r for r in traces if r not in anomalous_runs and r not in _aborted_set)):
         col = run_colors.get(rid, "#777")
         leg_row(row_off, col, "1.8", "", f"Run {rid} (normal)", col)
+        row_off += 20
+
+    # aborted runs legend
+    for rid in sorted(_aborted_set & set(traces)):
+        leg_row(row_off, "#FF6D00", "2", "", f"Run {rid}  ABORTED", "#FF6D00", bold=False)
         row_off += 20
 
     # anomalous runs
@@ -2785,7 +3316,7 @@ def svg_raw_trace(sensor, tool_id, run_dict, step_info,
 
 def svg_envelope_trace(sensor, tool_id, run_dict, step_info,
                        looped_per_run, run_colors, anomalous_runs,
-                       alarm_info=None):
+                       alarm_info=None, aborted_runs=None):
     """
     Baseline envelope chart for one sensor -- mirrors the reference good-vs-bad
     images:
@@ -2815,7 +3346,8 @@ def svg_envelope_trace(sensor, tool_id, run_dict, step_info,
     if not traces:
         return ""
 
-    normal_ids = [r for r in traces if r not in anomalous_runs]
+    _aborted_set_env = aborted_runs or set()
+    normal_ids = [r for r in traces if r not in anomalous_runs and r not in _aborted_set_env]
     anom_ids   = [r for r in traces if r in anomalous_runs]
 
     # reference run = most steps
@@ -2946,6 +3478,17 @@ def svg_envelope_trace(sensor, tool_id, run_dict, step_info,
                    f'stroke="{col}" stroke-width="1.2" opacity="0.50"/>')
 
     # ââ anomalous run traces (thick red, white halo) ââ
+    # aborted run traces (orange, medium weight)
+    if _aborted_set_env:
+        for rid in sorted(_aborted_set_env):
+            if rid not in traces:
+                continue
+            ts, vs = traces[rid]
+            pts = " ".join(f"{tx(t):.1f},{ty(v):.1f}" for t, v in zip(ts, vs))
+            svg.append(f'<polyline points="{pts}" fill="none" '
+                       f'stroke="#FF6D00" stroke-width="2" opacity="0.75"/>')
+
+    # anomalous run traces (thick red, white halo)
     for rid in sorted(anom_ids):
         ts, vs = traces[rid]
         pts = " ".join(f"{tx(t):.1f},{ty(v):.1f}" for t, v in zip(ts, vs))
@@ -3048,6 +3591,11 @@ def svg_envelope_trace(sensor, tool_id, run_dict, step_info,
     for ri, rid in enumerate(sorted(normal_ids)):
         col = run_colors.get(rid, "#388E3C")
         leg_row(row_off, col, "1.2", "", f"Run {rid}  Normal", "#37474F")
+        row_off += 14
+
+    # aborted run lines
+    for rid in sorted(_aborted_set_env & set(traces)):
+        leg_row(row_off, "#FF6D00", "2", "", f"Run {rid}  ABORTED", "#FF6D00", bold=False)
         row_off += 14
 
     # anomalous run lines
@@ -3575,10 +4123,10 @@ def svg_trend_chart(sensor, step_num, run_means_for_sensor,
     tool_color = {t: TOOL_COLORS[i % len(TOOL_COLORS)]
                   for i, t in enumerate(sorted(tools))}
 
-    # Only non-aborted runs that have data
-    pts = [(i, rid, run_tool.get(rid,'ALL'), run_means_for_sensor[rid])
-           for i, rid in enumerate(run_order)
-           if rid in run_means_for_sensor and rid not in aborted_runs]
+    # Only non-aborted runs that have data (run_order contains composite keys)
+    pts = [(i, ckey, run_tool.get(ckey, 'ALL'), run_means_for_sensor[ckey])
+           for i, ckey in enumerate(run_order)
+           if ckey in run_means_for_sensor and ckey not in aborted_runs]
     if not pts:
         return ''
 
@@ -3590,6 +4138,17 @@ def svg_trend_chart(sensor, step_num, run_means_for_sensor,
     n_runs   = len(run_order)
     def xp(i): return ml + pw * i / max(n_runs - 1, 1)
     def yp(v): return mt + ph * (1 - (v - ylo) / max(yhi - ylo, 1e-12))
+
+    # Per-tool statistics for separate bands
+    tool_stats = {}   # tool -> (mean, std)
+    by_tool_vals = defaultdict(list)
+    for _, ckey, tool, v in pts:
+        by_tool_vals[tool].append(v)
+    for tool, tvals in by_tool_vals.items():
+        if len(tvals) >= 2:
+            tm = sum(tvals) / len(tvals)
+            ts = math.sqrt(sum((v - tm) ** 2 for v in tvals) / len(tvals))
+            tool_stats[tool] = (tm, ts)
 
     mean_all = sum(vals) / len(vals)
     std_all  = math.sqrt(sum((v-mean_all)**2 for v in vals) / len(vals))
@@ -3626,17 +4185,20 @@ def svg_trend_chart(sensor, step_num, run_means_for_sensor,
             svg.append(f'<text x="{ml-5}" y="{yy+4:.1f}" text-anchor="end" '
                        f'font-size="10" fill="#666">{lbl}</text>')
 
-    # mean Â± std band
-    b1 = yp(mean_all + std_all); b2 = yp(mean_all - std_all)
-    svg.append(f'<rect x="{ml}" y="{min(b1,b2):.1f}" width="{pw}" '
-               f'height="{abs(b2-b1):.1f}" fill="#E3F2FD" opacity="0.5"/>')
-    ym = yp(mean_all)
-    svg.append(f'<line x1="{ml}" y1="{ym:.1f}" x2="{ml+pw}" y2="{ym:.1f}" '
-               f'stroke="#1565C0" stroke-width="1.2" stroke-dasharray="6,3" opacity="0.7"/>')
-
+    # Per-tool mean +/- std bands (each tool gets its own color band)
+    band_fill_opacity = 0.12 if len(tool_stats) > 1 else 0.30
+    for tool in sorted(tool_stats):
+        tm, ts = tool_stats[tool]
+        tcol = tool_color.get(tool, '#1565C0')
+        b1 = yp(tm + ts); b2 = yp(tm - ts)
+        svg.append(f'<rect x="{ml}" y="{min(b1,b2):.1f}" width="{pw}" '
+                   f'height="{abs(b2-b1):.1f}" fill="{tcol}" opacity="{band_fill_opacity}"/>')
+        ym = yp(tm)
+        svg.append(f'<line x1="{ml}" y1="{ym:.1f}" x2="{ml+pw}" y2="{ym:.1f}" '
+                   f'stroke="{tcol}" stroke-width="1.2" stroke-dasharray="6,3" opacity="0.7"/>')
     # per-tool connecting lines (non-aborted only)
     by_tool = defaultdict(list)
-    for i, rid, tool, v in pts:
+    for i, ckey, tool, v in pts:
         by_tool[tool].append((i, v))
     for tool, tpts in by_tool.items():
         col = tool_color.get(tool, '#555')
@@ -3647,15 +4209,16 @@ def svg_trend_chart(sensor, step_num, run_means_for_sensor,
                        f'stroke="{col}" stroke-width="1.4" opacity="0.45"/>')
 
     # normal dots + highflier diamonds
-    for i, rid, tool, v in pts:
+    for i, ckey, tool, v in pts:
+        rid_lbl = ckey.split("::", 1)[1] if "::" in ckey else ckey
         col = tool_color.get(tool, '#555')
-        hf  = highflier_info.get(rid)
+        hf  = highflier_info.get(ckey)
         if hf:
             # diamond shape
             cx = xp(i); cy = yp(v); r = 5.5
             hf_col = HIGHFLIER_REAL if hf['class'] == 'real' else HIGHFLIER_ART
             pts_d  = (f'{cx},{cy-r} {cx+r},{cy} {cx},{cy+r} {cx-r},{cy}')
-            tip = (f'Run {rid} HIGHFLIER ({hf["direction"]}) '
+            tip = (f'Run {rid_lbl} HIGHFLIER ({hf["direction"]}) '
                    f'val={v:.4g} | {hf["class"].upper()}: {hf["reason"]}')
             svg.append(f'<polygon points="{pts_d}" fill="{hf_col}" '
                        f'stroke="white" stroke-width="1">'
@@ -3663,19 +4226,20 @@ def svg_trend_chart(sensor, step_num, run_means_for_sensor,
         else:
             svg.append(f'<circle cx="{xp(i):.1f}" cy="{yp(v):.1f}" r="3.5" '
                        f'fill="{col}" stroke="white" stroke-width="0.8" opacity="0.85">'
-                       f'<title>Run {_esc(rid)} ({_esc(tool)}): {v:.4g}</title>'
+                       f'<title>Run {_esc(rid_lbl)} ({_esc(tool)}): {v:.4g}</title>'
                        f'</circle>')
 
     # aborted run markers -- orange triangles along bottom edge
     abort_y = mt + ph - 8
-    for i, rid in enumerate(run_order):
-        if rid not in aborted_runs:
+    for i, ckey in enumerate(run_order):
+        if ckey not in aborted_runs:
             continue
-        xx = xp(i)
-        cnt = row_counts.get(rid, '?')
+        xx      = xp(i)
+        rid_lbl = ckey.split("::", 1)[1] if "::" in ckey else ckey
+        cnt     = row_counts.get(ckey, '?')
         svg.append(f'<polygon points="{xx},{abort_y} {xx-5},{abort_y+12} '
                    f'{xx+5},{abort_y+12}" fill="{ABORT_COLOR}" opacity="0.9">'
-                   f'<title>Run {_esc(rid)} ABORTED ({cnt} rows)</title>'
+                   f'<title>Run {_esc(rid_lbl)} ABORTED ({cnt} rows)</title>'
                    f'</polygon>')
         svg.append(f'<text x="{xx}" y="{abort_y+22}" text-anchor="middle" '
                    f'font-size="8" fill="{ABORT_COLOR}">ABORT</text>')
@@ -3686,15 +4250,16 @@ def svg_trend_chart(sensor, step_num, run_means_for_sensor,
     svg.append(f'<line x1="{ml}" y1="{mt+ph}" x2="{ml+pw}" y2="{mt+ph}" '
                f'stroke="#999" stroke-width="1.5"/>')
 
-    # x-axis ticks
+    # x-axis ticks (show only the rid part, strip tool:: prefix)
     tick_every = max(1, n_runs // 10)
-    for i, rid in enumerate(run_order):
+    for i, ckey in enumerate(run_order):
         if i % tick_every == 0 or i == n_runs - 1:
-            xx = xp(i)
+            xx   = xp(i)
+            lbl  = ckey.split("::", 1)[1] if "::" in ckey else ckey
             svg.append(f'<line x1="{xx:.1f}" y1="{mt+ph}" x2="{xx:.1f}" '
                        f'y2="{mt+ph+5}" stroke="#999" stroke-width="1"/>')
             svg.append(f'<text x="{xx:.1f}" y="{mt+ph+16}" text-anchor="middle" '
-                       f'font-size="9" fill="#666">{_esc(rid)}</text>')
+                       f'font-size="9" fill="#666">{_esc(lbl)}</text>')
 
     # axis labels
     svg.append(f'<text x="{ml+pw//2}" y="{H-6}" text-anchor="middle" '
@@ -3703,22 +4268,38 @@ def svg_trend_chart(sensor, step_num, run_means_for_sensor,
                f'x="{ml-48}" y="{mt+ph//2+4}" text-anchor="middle" '
                f'font-size="10" fill="#555">{_esc(_short(sensor))}</text>')
 
-    # chart title
+    # chart title -- show per-tool mean/std when multiple tools present
     svg.append(f'<text x="{ml}" y="{mt-10}" font-size="11" font-weight="bold" '
                f'fill="#333">{_esc(sensor)}</text>')
-    cv_str = f'{std_all/abs(mean_all):.3f}' if abs(mean_all) > 1e-9 else 'n/a'
+    if len(tool_stats) > 1:
+        stats_parts = []
+        for _t in sorted(tool_stats):
+            _tm, _ts = tool_stats[_t]
+            _short_t = "_".join(_t.split("_")[-2:]) if "_" in _t else _t
+            _cv = f'{_ts/abs(_tm):.3f}' if abs(_tm) > 1e-9 else 'n/a'
+            stats_parts.append(f'{_short_t}: mean={_tm:.4g} std={_ts:.4g} CV={_cv}')
+        stats_str = "   |   ".join(stats_parts)
+    else:
+        cv_str = f'{std_all/abs(mean_all):.3f}' if abs(mean_all) > 1e-9 else 'n/a'
+        stats_str = f'mean={mean_all:.4g}  std={std_all:.4g}  CV={cv_str}'
     svg.append(f'<text x="{ml+pw}" y="{mt-10}" text-anchor="end" font-size="10" '
-               f'fill="#888">mean={mean_all:.4g}  std={std_all:.4g}  CV={cv_str}</text>')
+               f'fill="#888">{_esc(stats_str)}</text>')
 
     # legend row: tools + highflier symbols + abort symbol
     lx = ml; ly = mt + ph + 34
     for tool in sorted(tools):
         col = tool_color.get(tool, '#555')
-        short_tool = tool.split('_')[-1] if '_' in tool else tool
+        _parts = tool.split("_")
+        short_tool = "_".join(_parts[-3:]) if len(_parts) >= 3 else tool
+        # colored dot for the tool's runs
         svg.append(f'<rect x="{lx}" y="{ly}" width="11" height="8" fill="{col}"/>')
-        svg.append(f'<text x="{lx+14}" y="{ly+8}" font-size="9" fill="#444">'
-                   f'{_esc(short_tool)}</text>')
-        lx += min(140, pw // max(len(tools) + 3, 1))
+        # band swatch (semi-transparent fill matching the band)
+        band_op = 0.25 if len(tool_stats) > 1 else 0.50
+        svg.append(f'<rect x="{lx+13}" y="{ly}" width="22" height="8" '
+                   f'fill="{col}" opacity="{band_op}" stroke="{col}" stroke-width="0.5"/>')
+        svg.append(f'<text x="{lx+38}" y="{ly+8}" font-size="9" fill="#444">'
+                   f'{_esc(short_tool)} (mean+/-std band)</text>')
+        lx += min(200, pw // max(len(tools) + 2, 1))
     # highflier real
     svg.append(f'<polygon points="{lx},{ly+4} {lx+5},{ly} {lx+10},{ly+4} '
                f'{lx+5},{ly+8}" fill="{HIGHFLIER_REAL}"/>')
@@ -3740,21 +4321,37 @@ def svg_trend_chart(sensor, step_num, run_means_for_sensor,
     svg.append('</svg>')
     return '\n'.join(svg)
 
-def svg_corr_heatmap(sensors, corr, step_name):
+def svg_corr_heatmap(sensors, corr, step_name, min_abs_corr=0.5):
     """
     Render a Pearson correlation heatmap as an SVG.
-    Color scale: -1 â blue, 0 â white, +1 â red.
+    Color scale: -1 -> blue, 0 -> white, +1 -> red.
+
+    Only sensors with at least one |r| >= min_abs_corr off-diagonal are shown.
+    Cells below the threshold are rendered as blank white.
+    Full sensor names are printed without truncation.
     """
+    # Filter to sensors with at least one strong off-diagonal correlation
+    keep_idx = [i for i in range(len(sensors))
+                if any(abs(corr[i][j]) >= min_abs_corr
+                       for j in range(len(sensors)) if j != i)]
+    if not keep_idx:
+        return ''
+    sensors = [sensors[i] for i in keep_idx]
+    corr    = [[corr[i][j] for j in keep_idx] for i in keep_idx]
+
     ns   = len(sensors)
     if ns == 0:
         return ''
     cell  = max(36, min(64, 600 // ns))
-    pad_l = 180   # left padding for y-axis labels
+    # Compute label padding from the longest full sensor name
+    max_label_len = max(len(s) for s in sensors)
+    pad_l = max(200, min(600, max_label_len * 7))
     pad_t = 20    # top padding
-    pad_b = 180   # bottom for x-axis labels (rotated)
+    pad_b = max(200, min(600, max_label_len * 7))  # bottom for rotated x labels
     pad_r = 20
     W     = pad_l + ns * cell + pad_r
     H     = pad_t + ns * cell + pad_b
+
 
     def _color(r):
         r = max(-1.0, min(1.0, r))
@@ -3784,29 +4381,33 @@ def svg_corr_heatmap(sensors, corr, step_name):
             x  = pad_l + j * cell
             y  = pad_t + i * cell
             r  = corr[i][j]
-            fc = _color2(r)
+            # Show color only when |r| >= threshold (or diagonal); blank otherwise
+            if i == j or abs(r) >= min_abs_corr:
+                fc = _color2(r)
+            else:
+                fc = '#F5F5F5'   # near-white for below-threshold cells
             svg.append(f'<rect x="{x}" y="{y}" width="{cell}" height="{cell}" '
                        f'fill="{fc}" stroke="white" stroke-width="0.5"/>')
-            txt_col = '#333' if abs(r) < 0.6 else 'white'
-            lbl     = f'{r:.2f}' if i != j else '1.00'
-            svg.append(f'<text x="{x+cell//2}" y="{y+cell//2+4}" '
-                       f'text-anchor="middle" font-size="{max(8, cell//4+2)}" '
-                       f'fill="{txt_col}">{lbl}</text>')
+            # Only print value when |r| >= threshold or diagonal
+            if i == j or abs(r) >= min_abs_corr:
+                txt_col = '#333' if abs(r) < 0.6 else 'white'
+                lbl     = f'{r:.2f}' if i != j else '1.00'
+                svg.append(f'<text x="{x+cell//2}" y="{y+cell//2+4}" '
+                           f'text-anchor="middle" font-size="{max(8, cell//4+2)}" '
+                           f'fill="{txt_col}">{lbl}</text>')
 
-    # y-axis labels (right-aligned, truncated)
+    # y-axis labels -- full sensor name, no truncation
     for i, s in enumerate(sensors):
         y = pad_t + i * cell + cell // 2 + 4
-        lbl = _short(s)[:28]
         svg.append(f'<text x="{pad_l-6}" y="{y}" text-anchor="end" '
-                   f'font-size="11" fill="#333">{_esc(lbl)}</text>')
+                   f'font-size="11" fill="#333">{_esc(s)}</text>')
 
-    # x-axis labels (rotated -45Â°)
+    # x-axis labels (rotated -45 deg) -- full sensor name, no truncation
     for j, s in enumerate(sensors):
         x = pad_l + j * cell + cell // 2
         y = pad_t + ns * cell + 8
-        lbl = _short(s)[:28]
         svg.append(f'<text transform="rotate(-45,{x},{y})" x="{x}" y="{y}" '
-                   f'text-anchor="end" font-size="11" fill="#333">{_esc(lbl)}</text>')
+                   f'text-anchor="end" font-size="11" fill="#333">{_esc(s)}</text>')
 
     # color scale legend
     leg_x = pad_l; leg_y = H - 18; leg_w = ns * cell; leg_h = 10
@@ -3955,10 +4556,13 @@ def _build_overview_section(tool_results):
 
     for tool_id, run_info in sorted(tool_results.items()):
         parts.append(f'<h3>Tool {_esc(tool_id)}</h3>')
-        parts.append('<div class="card"><table><tr><th>Run</th><th>Rows</th>'
+        parts.append('<div class="card"><table><tr><th>Run ID</th><th>Rows</th>'
                      '<th>Score</th><th>Status</th><th>Lead Sensor</th>'
                      '<th>First ARC</th><th>Top sensors</th></tr>')
-        for rid in sorted(run_info):
+        def _run_sort_key(r):
+            try: return (0, int(r))
+            except (ValueError, TypeError): return (1, r)
+        for rid in sorted(run_info, key=_run_sort_key):
             info = run_info[rid]
             if info["is_abort"]:
                 chip = '<span class="chip-ab">ABORTED</span>'
@@ -4111,22 +4715,27 @@ def _write_anomaly_sections(fh, tool_results, tool_runs, step_info_per_run, loop
 
     if primary_sensor:
         for tool_id in sorted(tool_runs):
+            aborted_set_t  = {rid for tid, rid in aborted_all if tid == tool_id}
             run_dict_clean = {rid: rrows for rid, rrows in tool_runs[tool_id].items()
-                              if rid not in aborted_all}
-            anom_set_t  = {rid for rid in anom_set_all if rid in tool_runs.get(tool_id, {})}
+                              if (tool_id, rid) not in aborted_all}
+            run_dict_chart = dict(tool_runs[tool_id])
+            anom_set_t  = {rid for t_id, rid in anom_set_all if t_id == tool_id}
             run_ids     = sorted(run_dict_clean)
             run_colors  = {rid: RUN_COLORS[i % len(RUN_COLORS)] for i, rid in enumerate(run_ids)}
-            looped_t    = {rid: v for rid, v in looped.items() if rid in run_dict_clean}
-            svg_env = svg_envelope_trace(primary_sensor, tool_id, run_dict_clean,
+            for rid in aborted_set_t:
+                run_colors[rid] = "#FF6D00"
+            looped_t    = {rid: v for rid, v in looped.items() if rid in run_dict_chart}
+            svg_env = svg_envelope_trace(primary_sensor, tool_id, run_dict_chart,
                                           step_info_per_run, looped_t, run_colors,
-                                          anom_set_t, alarm_info=alarm_info)
+                                          anom_set_t, alarm_info=alarm_info,
+                                          aborted_runs=aborted_set_t)
             if svg_env:
                 fh.write(
                     f'<div class="card">'
                     f'<h3>Primary Fault Sensor &mdash; {_esc(primary_sensor)}</h3>'
                     f'<p style="font-size:12px;color:#666">Green band = normal-run envelope '
                     f'(median &plusmn;3&times;MAD). Thick red = anomalous runs. '
-                    f'Aborted runs excluded.</p>'
+                    f'Orange = aborted runs.</p>'
                     f'{svg_env}</div>\n')
         fh.flush()
 
@@ -4199,12 +4808,17 @@ def _write_anomaly_sections(fh, tool_results, tool_runs, step_info_per_run, loop
     fh.write('<section id="envelope"><h2>5 &mdash; Baseline Envelope Traces</h2>\n')
     for tool_id in sorted(tool_runs):
         lead_lag       = lead_lag_all.get(tool_id, {})
-        anom_set_t     = {rid for rid in anom_set_all if rid in tool_runs.get(tool_id, {})}
+        anom_set_t     = {rid for t_id, rid in anom_set_all if t_id == tool_id}
+        aborted_set_t  = {rid for tid, rid in aborted_all if tid == tool_id}
         run_dict_clean = {rid: rrows for rid, rrows in tool_runs[tool_id].items()
-                          if rid not in aborted_all}
+                          if (tool_id, rid) not in aborted_all}
+        # Chart dict includes aborted runs so they appear as orange traces
+        run_dict_chart = dict(tool_runs[tool_id])
         run_ids        = sorted(run_dict_clean)
         run_colors     = {rid: RUN_COLORS[i % len(RUN_COLORS)] for i, rid in enumerate(run_ids)}
-        looped_t       = {rid: v for rid, v in looped.items() if rid in run_dict_clean}
+        for rid in aborted_set_t:
+            run_colors[rid] = "#FF6D00"
+        looped_t       = {rid: v for rid, v in looped.items() if rid in run_dict_chart}
         per_sensor_sc  = per_sensor_sc_all.get(tool_id, {})
 
         env_sensors = []; seen_env = set()
@@ -4221,12 +4835,13 @@ def _write_anomaly_sections(fh, tool_results, tool_runs, step_info_per_run, loop
             fh.write(f'<h3>Tool {_esc(tool_id)}</h3><div class="card">\n')
             for sensor in env_sensors:
                 has = any(_f(r.get(sensor)) is not None
-                          for rrows in run_dict_clean.values() for r in rrows)
+                          for rrows in run_dict_chart.values() for r in rrows)
                 if not has:
                     continue
-                svg = svg_envelope_trace(sensor, tool_id, run_dict_clean,
+                svg = svg_envelope_trace(sensor, tool_id, run_dict_chart,
                                           step_info_per_run, looped_t, run_colors,
-                                          anom_set_t, alarm_info=alarm_info)
+                                          anom_set_t, alarm_info=alarm_info,
+                                          aborted_runs=aborted_set_t)
                 if svg:
                     fh.write(svg + '\n')
             fh.write('</div>\n')
@@ -4238,12 +4853,17 @@ def _write_anomaly_sections(fh, tool_results, tool_runs, step_info_per_run, loop
     fh.write('<section id="rawtraces"><h2>6 &mdash; Raw Sensor Traces</h2>\n')
     for tool_id in sorted(tool_runs):
         lead_lag       = lead_lag_all.get(tool_id, {})
-        anom_set_t     = {rid for rid in anom_set_all if rid in tool_runs.get(tool_id, {})}
+        anom_set_t     = {rid for t_id, rid in anom_set_all if t_id == tool_id}
+        aborted_set_t  = {rid for tid, rid in aborted_all if tid == tool_id}
         run_dict_clean = {rid: rrows for rid, rrows in tool_runs[tool_id].items()
-                          if rid not in aborted_all}
+                          if (tool_id, rid) not in aborted_all}
+        # Chart dict includes aborted runs so they appear as orange traces
+        run_dict_chart = dict(tool_runs[tool_id])
         run_ids        = sorted(run_dict_clean)
         run_colors     = {rid: RUN_COLORS[i % len(RUN_COLORS)] for i, rid in enumerate(run_ids)}
-        looped_t       = {rid: v for rid, v in looped.items() if rid in run_dict_clean}
+        for rid in aborted_set_t:
+            run_colors[rid] = "#FF6D00"
+        looped_t       = {rid: v for rid, v in looped.items() if rid in run_dict_chart}
 
         ordered = []; seen_s = set()
         for rid, (lead, chain, _) in sorted(lead_lag.items()):
@@ -4254,12 +4874,13 @@ def _write_anomaly_sections(fh, tool_results, tool_runs, step_info_per_run, loop
             fh.write(f'<h3>Tool {_esc(tool_id)}</h3><div class="card">\n')
             for sensor in ordered:
                 has = any(_f(r.get(sensor)) is not None
-                          for rrows in run_dict_clean.values() for r in rrows)
+                          for rrows in run_dict_chart.values() for r in rrows)
                 if not has:
                     continue
-                svg = svg_raw_trace(sensor, tool_id, run_dict_clean,
+                svg = svg_raw_trace(sensor, tool_id, run_dict_chart,
                                      step_info_per_run, looped_t, run_colors,
-                                     anom_set_t, alarm_info=alarm_info)
+                                     anom_set_t, alarm_info=alarm_info,
+                                     aborted_runs=aborted_set_t)
                 if svg:
                     fh.write(svg + '\n')
             fh.write('</div>\n')
@@ -4277,7 +4898,7 @@ def _write_anomaly_sections(fh, tool_results, tool_runs, step_info_per_run, loop
             "Normal":            ("#2E7D32", "#E8F5E9"),
         }
         for tool_id in sorted(tool_runs):
-            anom_set_t = {rid for rid in anom_set_all if rid in tool_runs.get(tool_id, {})}
+            anom_set_t = {rid for t_id, rid in anom_set_all if t_id == tool_id}
             if not anom_set_t:
                 continue
             fh.write(f'<h3>Tool {_esc(tool_id)}</h3><div class="card">\n')
@@ -4301,7 +4922,7 @@ def _write_anomaly_sections(fh, tool_results, tool_runs, step_info_per_run, loop
             # SP deviation charts for anomalous runs in this tool
             if sp_pairs:
                 run_dict_t   = {rid: rrows for rid, rrows in tool_runs[tool_id].items()
-                                if rid not in aborted_all}
+                                if (tool_id, rid) not in aborted_all}
                 run_ids_t    = sorted(run_dict_t)
                 run_colors_t = {rid: RUN_COLORS[i % len(RUN_COLORS)]
                                 for i, rid in enumerate(run_ids_t)}
@@ -4326,10 +4947,19 @@ def _write_anomaly_sections(fh, tool_results, tool_runs, step_info_per_run, loop
 
 def _write_step_sections(fh, step_info_si, run_order_si, run_tool_si,
                           run_means_by_step, highfliers,
-                          aborted_all, row_counts_all):
+                          aborted_all, row_counts_all,
+                          forced_step_sensors=None,
+                          noisy_sensor_steps=None):
     """Write section 8 (step importance) to open file handle, then close it."""
+    forced_step_sensors  = forced_step_sensors  or {}
+    noisy_sensor_steps   = noisy_sensor_steps   or set()
     tools_si  = sorted(set(run_tool_si.values()))
-    top_steps = sorted(step_info_si, key=lambda s: -step_info_si[s]["mean_cv"])[:TOP_N_STEPS]
+    # Top steps by CV ranking
+    cv_top_steps = sorted(step_info_si, key=lambda s: -step_info_si[s]["mean_cv"])[:TOP_N_STEPS]
+    # Forced steps: steps not already in top_steps but containing anomaly-flagged sensors
+    forced_only_steps = [sn for sn in forced_step_sensors if sn not in cv_top_steps
+                         and sn in step_info_si]
+    top_steps = cv_top_steps + forced_only_steps
     all_steps = sorted(step_info_si, key=lambda s: -step_info_si[s]["mean_cv"])
 
     print("  Writing section 8 (step importance ranking) ...")
@@ -4343,9 +4973,16 @@ def _write_step_sections(fh, step_info_si, run_order_si, run_tool_si,
              '<th>Rows</th><th>Runs</th><th>Mean CV</th><th>Top sensors</th></tr>\n')
     for rank, sn in enumerate(all_steps, 1):
         si     = step_info_si[sn]
-        is_top = sn in top_steps
+        is_top    = sn in cv_top_steps
+        is_forced = sn in forced_only_steps
         cls    = ' class="top1"' if rank == 1 else ""
-        badge  = '<span class="badge-top">CHARTED</span>' if is_top else ""
+        if is_top:
+            badge = '<span class="badge-top">CHARTED</span>'
+        elif is_forced:
+            badge = ('<span class="badge-top" style="background:#D32F2F">'
+                     'ANOMALY FLAGGED</span>')
+        else:
+            badge = ""
         top3   = si["sensor_cvs"][:3]
         top_str = "&nbsp;&nbsp;".join(
             f'<b>{_esc(_short(s))}</b> CV={cv:.3f}' for s, cv, *_ in top3)
@@ -4359,108 +4996,219 @@ def _write_step_sections(fh, step_info_si, run_order_si, run_tool_si,
 
     # Per-step detail
     for sn in top_steps:
-        si      = step_info_si[sn]
+        si      = step_info_si.get(sn, {})
+        if not si:
+            continue
         rm_step = run_means_by_step.get(sn, {})
         hf_step = highfliers.get(sn, {})
+
+        is_forced = sn in forced_only_steps
+        cv_rank   = cv_top_steps.index(sn) + 1 if sn in cv_top_steps else None
+        if is_forced:
+            badge = '<span class="badge-top" style="background:#D32F2F">ANOMALY FLAGGED</span>'
+            reason_note = ('Step included because anomaly-flagged sensors were detected here '
+                           'during per-sensor independent analysis.')
+        else:
+            badge = f'<span class="badge-top">Top {cv_rank}</span>'
+            reason_note = None
 
         print(f"  Writing step {sn} ({si['name']}) detail ...")
         fh.write(
             f'<h3>Step {_esc(sn)} &mdash; {_esc(si["name"])}'
-            f'<span class="badge-top">Top {top_steps.index(sn)+1}</span></h3>\n'
+            f'{badge}</h3>\n'
             f'<p style="font-size:12px;color:#666">{si["rows"]:,} rows, '
             f'{si["n_runs"]} runs. Mean CV = <b>{si["mean_cv"]:.4f}</b>.</p>\n')
+        if reason_note:
+            fh.write(f'<p style="font-size:12px;color:#D32F2F">'
+                     f'&#9679; {_esc(reason_note)}</p>\n')
 
-        # Stats table
-        fh.write('<div class="card"><h3>Sensor Statistics</h3>'
-                 '<table><tr><th>Sensor</th><th>Mean</th><th>Std</th>'
-                 '<th>Min run-mean</th><th>Max run-mean</th>'
-                 '<th>Range</th><th>CV</th><th>Highfliers</th></tr>\n')
-        for s, cv, mn, std, rng in si["sensor_cvs"]:
-            rvals = list(rm_step.get(s, {}).values())
-            rmin  = min(rvals) if rvals else float("nan")
-            rmax  = max(rvals) if rvals else float("nan")
-            bar_w = min(int(cv / max(si["sensor_cvs"][0][1], 1e-9) * 60), 60)
-            bar   = (f'<span style="display:inline-block;width:{bar_w}px;height:8px;'
-                     f'background:#1565C0;border-radius:2px;vertical-align:middle;'
-                     f'margin-right:4px"></span>')
-            hf_s  = hf_step.get(s, {})
-            if hf_s:
-                real_r = [r for r, h in hf_s.items() if h["class"] == "real"]
-                art_r  = [r for r, h in hf_s.items() if h["class"] == "artifact"]
-                hf_str = ""
-                if real_r:
-                    shown = ", ".join(sorted(real_r)[:3]) + ("\u2026" if len(real_r) > 3 else "")
-                    hf_str += (f'<span style="color:{HIGHFLIER_REAL};font-weight:bold">'
-                               f'{len(real_r)} real</span> '
-                               f'<span style="font-size:10px;color:#888">({shown})</span> ')
-                if art_r:
-                    shown = ", ".join(sorted(art_r)[:3]) + ("\u2026" if len(art_r) > 3 else "")
-                    hf_str += (f'<span style="color:#9E6C00;font-weight:bold">'
-                               f'{len(art_r)} artifact</span> '
-                               f'<span style="font-size:10px;color:#888">({shown})</span>')
-            else:
-                hf_str = '<span style="color:#aaa">none</span>'
-            fh.write(
-                f'<tr><td><b>{_esc(s)}</b><br>'
-                f'<span style="font-size:10px;color:#888">{_esc(_short(s))}</span></td>'
-                f'<td>{mn:.4g}</td><td>{std:.4g}</td>'
-                f'<td>{rmin:.4g}</td><td>{rmax:.4g}</td>'
-                f'<td>{rng:.4g}</td><td>{bar}{cv:.4f}</td>'
-                f'<td style="font-size:11px">{hf_str}</td></tr>\n')
-        fh.write('</table></div>\n')
+        # Forced sensors for this step (not already in sensor_cvs)
+        cv_sensor_names = {s for s, *_ in si.get("sensor_cvs", [])}
+        forced_sensors_this_step = forced_step_sensors.get(sn, set()) - cv_sensor_names
+
+        # Stats table -- one sub-table per tool
+        for _t_stat in tools_si:
+            _t_run_set = {ck for ck in run_tool_si if run_tool_si[ck] == _t_stat}
+            _short_t   = "_".join(_t_stat.split("_")[-3:]) if "_" in _t_stat else _t_stat
+            fh.write(f'<div class="card"><h3>Sensor Statistics &mdash; '
+                     f'{_esc(_short_t)}</h3>'
+                     f'<table><tr><th>Sensor</th><th>Mean</th><th>Std</th>'
+                     f'<th>Min run-mean</th><th>Max run-mean</th>'
+                     f'<th>Range</th><th>CV</th><th>Highfliers</th></tr>\n')
+            max_cv_t = max((cv for s, cv, *_ in si.get("sensor_cvs", [])), default=1e-9)
+            # All sensors to show: CV-ranked + forced sensors for this step
+            _cv_rows   = [(s, cv, False) for s, cv, *_ in si.get("sensor_cvs", [])]
+            _forced_rows = [(s, 0.0, True) for s in sorted(forced_sensors_this_step)]
+            for s, cv, _is_forced in _cv_rows + _forced_rows:
+                cv = cv  # already set above, re-assign for clarity
+                rvals = [v for ck, v in rm_step.get(s, {}).items()
+                         if ck in _t_run_set]
+                if not rvals:
+                    continue
+                import math as _math
+                rmin  = min(rvals); rmax = max(rvals)
+                tmn   = sum(rvals) / len(rvals)
+                tstd  = _math.sqrt(sum((v-tmn)**2 for v in rvals)/len(rvals)) if len(rvals)>1 else 0.0
+                trng  = rmax - rmin
+                tcv   = tstd / abs(tmn) if abs(tmn) > 1e-9 else 0.0
+                bar_w = min(int(tcv / max(max_cv_t, 1e-9) * 60), 60)
+                bar   = (f'<span style="display:inline-block;width:{bar_w}px;height:8px;'
+                         f'background:#1565C0;border-radius:2px;vertical-align:middle;'
+                         f'margin-right:4px"></span>')
+                hf_s  = {ck: info for ck, info in hf_step.get(s, {}).items()
+                         if ck in _t_run_set}
+                if hf_s:
+                    real_r = [r for r, h in hf_s.items() if h["class"] == "real"]
+                    art_r  = [r for r, h in hf_s.items() if h["class"] == "artifact"]
+                    hf_str = ""
+                    if real_r:
+                        shown = ", ".join(sorted(real_r)[:3]) + ("\u2026" if len(real_r) > 3 else "")
+                        hf_str += (f'<span style="color:{HIGHFLIER_REAL};font-weight:bold">'
+                                   f'{len(real_r)} real</span> '
+                                   f'<span style="font-size:10px;color:#888">({shown})</span> ')
+                    if art_r:
+                        shown = ", ".join(sorted(art_r)[:3]) + ("\u2026" if len(art_r) > 3 else "")
+                        hf_str += (f'<span style="color:#9E6C00;font-weight:bold">'
+                                   f'{len(art_r)} artifact</span> '
+                                   f'<span style="font-size:10px;color:#888">({shown})</span>')
+                else:
+                    hf_str = '<span style="color:#aaa">none</span>'
+                forced_badge = (' <span style="background:#D32F2F;color:white;'
+                                'font-size:9px;padding:1px 4px;border-radius:2px">'
+                                'ANOMALY</span>') if _is_forced else ''
+                fh.write(
+                    f'<tr><td><b>{_esc(s)}</b>{forced_badge}<br>'
+                    f'<span style="font-size:10px;color:#888">{_esc(_short(s))}</span></td>'
+                    f'<td>{tmn:.4g}</td><td>{tstd:.4g}</td>'
+                    f'<td>{rmin:.4g}</td><td>{rmax:.4g}</td>'
+                    f'<td>{trng:.4g}</td><td>{bar}{tcv:.4f}</td>'
+                    f'<td style="font-size:11px">{hf_str}</td></tr>\n')
+            fh.write('</table></div>\n')
         fh.flush()
 
         # Highflier detail
-        all_hf = [(s, rid, info) for s, flags in hf_step.items()
-                  for rid, info in flags.items()]
-        if all_hf:
-            fh.write('<div class="card"><h3>Highflier Detail</h3>'
+        for _t_hf in tools_si:
+            _t_hf_run_set = {ck for ck in run_tool_si if run_tool_si[ck] == _t_hf}
+            _short_t_hf   = "_".join(_t_hf.split("_")[-3:]) if "_" in _t_hf else _t_hf
+            all_hf = [(s, ckey, info) for s, flags in hf_step.items()
+                      for ckey, info in flags.items() if ckey in _t_hf_run_set]
+            if not all_hf:
+                continue
+            fh.write(f'<div class="card"><h3>Highflier Detail &mdash; '
+                     f'{_esc(_short_t_hf)}</h3>'
                      f'<p style="font-size:12px;color:#666">Runs beyond '
                      f'median &plusmn;{HIGHFLIER_IQR_MULT}&times;IQR.</p>'
                      '<table><tr><th>Sensor</th><th>Run</th><th>Value</th>'
                      '<th>Dir</th><th>Class</th><th>Reason</th></tr>\n')
-            for s, rid, info in sorted(all_hf, key=lambda x: (x[2]["class"], x[0], x[1])):
+            for s, ckey, info in sorted(all_hf, key=lambda x: (x[2]["class"], x[0], x[1])):
+                rid_lbl = ckey.split("::", 1)[1] if "::" in ckey else ckey
                 cls    = info["class"]
                 hf_col = HIGHFLIER_REAL if cls == "real" else HIGHFLIER_ART
                 lbl    = "REAL ISSUE" if cls == "real" else "DATA ARTIFACT"
                 fh.write(
-                    f'<tr class="{cls}"><td>{_esc(s)}</td><td><b>{_esc(rid)}</b></td>'
+                    f'<tr class="{cls}"><td>{_esc(s)}</td><td><b>{_esc(rid_lbl)}</b></td>'
                     f'<td>{info["value"]:.4g}</td><td>{info["direction"]}</td>'
                     f'<td><span style="background:{hf_col};color:white;padding:1px 6px;'
                     f'border-radius:3px;font-size:11px">{lbl}</span></td>'
                     f'<td style="font-size:11px">{_esc(info["reason"])}</td></tr>\n')
             fh.write('</table></div>\n')
-            fh.flush()
-
-        # Trend charts
-        fh.write('<div class="card"><h3>Per-Run Trend Charts</h3>'
-                 '<div class="sensor-grid">\n')
-        for s, cv, mn, std, rng in si["sensor_cvs"]:
-            rm_sensor = rm_step.get(s, {})
-            if len(rm_sensor) < 3:
-                continue
-            hf_sensor = hf_step.get(s, {})
-            svg = svg_trend_chart(s, sn, rm_sensor, run_order_si, run_tool_si,
-                                   tools_si, aborted_runs=aborted_all,
-                                   row_counts=row_counts_all,
-                                   highflier_info=hf_sensor)
-            if svg:
-                fh.write(f'<div>{svg}</div>\n')
-        fh.write('</div></div>\n')
         fh.flush()
 
-        # Correlation heatmap
+        # Trend charts -- one sub-section per tool so each tool's runs are
+        # plotted independently with its own mean+/-std band.
+        fh.write('<div class="card"><h3>Per-Run Trend Charts</h3>\n')
+        for _tool in tools_si:
+            # Filter run_order and run_means to this tool only
+            _tool_run_order = [ck for ck in run_order_si
+                               if run_tool_si.get(ck) == _tool]
+            if not _tool_run_order:
+                continue
+            _tool_run_set   = set(_tool_run_order)
+            _tool_run_tool  = {ck: _tool for ck in _tool_run_order}
+            _short_tool     = "_".join(_tool.split("_")[-3:]) if "_" in _tool else _tool
+
+            fh.write(f'<h4 style="margin:10px 0 4px;color:#37474F">'
+                     f'Tool: {_esc(_short_tool)}</h4>'
+                     f'<div class="sensor-grid">\n')
+
+            # CV-ranked sensors
+            for s, cv, mn, std, rng in si.get("sensor_cvs", []):
+                rm_sensor_all  = rm_step.get(s, {})
+                rm_sensor_tool = {ck: v for ck, v in rm_sensor_all.items()
+                                  if ck in _tool_run_set}
+                if len(rm_sensor_tool) < 3:
+                    continue
+                hf_sensor = {ck: info for ck, info in hf_step.get(s, {}).items()
+                             if ck in _tool_run_set}
+                svg = svg_trend_chart(s, sn, rm_sensor_tool,
+                                      _tool_run_order, _tool_run_tool,
+                                      [_tool],
+                                      aborted_runs=aborted_all,
+                                      row_counts=row_counts_all,
+                                      highflier_info=hf_sensor)
+                if svg:
+                    fh.write(f'<div>{svg}</div>\n')
+
+            # Forced sensors (anomaly-flagged, not in CV-ranked list)
+            if forced_sensors_this_step:
+                fh.write('</div>\n'
+                         '<p style="font-size:11px;color:#D32F2F;margin:4px 0">'
+                         '&#9679; Sensors below were not top-ranked by CV but had '
+                         'anomalous runs detected by per-sensor analysis:</p>'
+                         '<div class="sensor-grid">\n')
+                for s in sorted(forced_sensors_this_step):
+                    rm_sensor_all  = rm_step.get(s, {})
+                    rm_sensor_tool = {ck: v for ck, v in rm_sensor_all.items()
+                                      if ck in _tool_run_set}
+                    if len(rm_sensor_tool) < 3:
+                        continue
+                    svg = svg_trend_chart(s, sn, rm_sensor_tool,
+                                          _tool_run_order, _tool_run_tool,
+                                          [_tool],
+                                          aborted_runs=aborted_all,
+                                          row_counts=row_counts_all)
+                    if svg:
+                        fh.write(f'<div>{svg}</div>\n')
+
+            fh.write('</div>\n')
+        fh.write('</div>\n')
+        fh.flush()
+
+        # Correlation heatmap -- one per tool so HW differences do not mix
         artifact_runs = {rid for flags in hf_step.values()
                          for rid, info in flags.items() if info.get("class") == "artifact"}
         excl_corr = aborted_all | artifact_runs
-        corr_sensors, corr_matrix = compute_correlations(rm_step, excl_corr)
-        if corr_sensors:
-            fh.write('<div class="card"><h3>Sensor Correlation Matrix</h3>'
-                     f'<p style="font-size:12px;color:#666">Pearson r of per-run means. '
-                     f'{len(excl_corr)} run(s) excluded (aborted + artifact). '
+        # Exclude sensors that are flagged as noisy for this specific step --
+        # their run-means are noise-driven and would pollute the correlations.
+        rm_step_clean = {s: rd for s, rd in rm_step.items()
+                         if (s, sn) not in noisy_sensor_steps}
+        # collect all composite keys present in rm_step_clean, grouped by tool
+        _all_rm_runs = set()
+        for _sv in rm_step_clean.values():
+            _all_rm_runs.update(_sv.keys())
+        _tool_run_ids = defaultdict(list)
+        for _ckey in _all_rm_runs:
+            _tool_run_ids[run_tool_si.get(_ckey, "ALL")].append(_ckey)
+        # Always render one heatmap per tool (never skip a tool)
+        _any_corr = False
+        for _t_name in sorted(_tool_run_ids):
+            # Exclude runs from all other tools so each heatmap is tool-specific
+            _excl_this = excl_corr | (_all_rm_runs - set(_tool_run_ids[_t_name]))
+            _cs, _cm = compute_correlations(rm_step_clean, _excl_this)
+            if not _cs:
+                continue
+            if not _any_corr:
+                fh.write('<div class="card"><h3>Sensor Correlation Matrix</h3>\n')
+                _any_corr = True
+            fh.write(f'<h4 style="margin:12px 0 4px">'
+                     f'Tool: {_esc(_t_name)}</h4>\n')
+            n_runs_t = len(_tool_run_ids[_t_name]) - len(excl_corr & set(_tool_run_ids[_t_name]))
+            fh.write(f'<p style="font-size:12px;color:#666">Pearson r of per-run means '
+                     f'({n_runs_t} runs). '
                      f'<span style="color:#C62828">Red</span>=positive, '
                      f'<span style="color:#1565C0">Blue</span>=negative.</p>\n')
-            fh.write(svg_corr_heatmap(corr_sensors, corr_matrix, si["name"]) + '\n')
+            fh.write(svg_corr_heatmap(_cs, _cm, si["name"]) + '\n')
+        if _any_corr:
             fh.write('</div>\n')
             fh.flush()
 
@@ -4575,7 +5323,7 @@ def main():
 
     # ── 4. Aborted run detection ──────────────────────────────────────────────
     print("\nDetecting aborted runs ...")
-    aborted_all, row_counts_all = detect_aborted_runs(rows, schema["run_col"])
+    aborted_all, row_counts_all = detect_aborted_runs(tool_runs)
     if not aborted_all:
         print("  None detected.")
 
@@ -4602,7 +5350,7 @@ def main():
     for tool_id in sorted(tool_runs):
         run_dict       = tool_runs[tool_id]
         run_dict_clean = {rid: rrows for rid, rrows in run_dict.items()
-                          if rid not in aborted_all}
+                          if (tool_id, rid) not in aborted_all}
         run_ids        = sorted(run_dict)
         use_stable_core = len(run_dict_clean) >= 10
 
@@ -4639,17 +5387,77 @@ def main():
 
         baselines_full_all[tool_id] = baselines_full
 
+        # Precompute MFC ramp intervals for this tool (Feature 3)
+        mfc_ramp_ivs = {}
+        for s in _SENSORS:
+            if _is_mfc_flow_sensor(s):
+                ivs = _build_mfc_ramp_intervals(run_dict_clean, s)
+                if ivs:
+                    mfc_ramp_ivs[s] = ivs
+
         composite = {}; per_sensor_sc = defaultdict(dict)
         for rid, rrows in run_dict_clean.items():
             total = 0.0
             for s, bl in baselines_full.items():
-                sc = compute_run_score(rrows, bl, s)
+                sc = compute_run_score(rrows, bl, s,
+                                       ramp_intervals=mfc_ramp_ivs.get(s))
                 per_sensor_sc[rid][s] = sc; total += sc
             composite[rid] = total
 
+        # Per-step scoring pass: score each step independently so a
+        # localised shift confined to one step (e.g. Dep DCBias) is
+        # not diluted by noise across the other steps.
+        step_nums_in_data = set()
+        for _rrows_v in run_dict_clean.values():
+            for _r in _rrows_v:
+                _sn_v = _r.get("_step_number", "")
+                if _sn_v: step_nums_in_data.add(_sn_v)
+        step_nums_in_data -= SKIP_STEPS
+        for _sn_v in sorted(step_nums_in_data):
+            _sf = {_sn_v}
+            _step_comp = {}
+            for rid, rrows in run_dict_clean.items():
+                _step_comp[rid] = sum(
+                    compute_run_score(rrows, bl, s, step_filter=_sf,
+                                      ramp_intervals=mfc_ramp_ivs.get(s))
+                    for s, bl in baselines_full.items())
+            _step_anom = flag_anomalous(_step_comp)
+            for rid, _is_a in _step_anom.items():
+                if _is_a:
+                    composite[rid] = max(composite.get(rid, 0.0),
+                                         _step_comp[rid])
+
+        # Piecewise anomaly detection (Feature 5): if one sensor dominates
+        # the composite score, segregate it and score independently to
+        # ensure runs with smaller-but-real anomalies are still detected.
+        segregated_sensors = _segregate_outlier_sensors(per_sensor_sc)
+        if segregated_sensors:
+            print(f"  Tool {tool_id}: segregating outlier sensor(s) for independent "
+                  f"scoring: {sorted(segregated_sensors)}")
+            composite_normal = {}
+            composite_segregated = {}
+            for rid in run_dict_clean:
+                total_normal = 0.0
+                total_seg    = 0.0
+                for s, bl in baselines_full.items():
+                    sc = per_sensor_sc[rid].get(s, 0.0)
+                    if s in segregated_sensors:
+                        total_seg    += sc
+                    else:
+                        total_normal += sc
+                composite_normal[rid]     = total_normal
+                composite_segregated[rid] = total_seg
+            anomalous_normal = flag_anomalous(composite_normal) if composite_normal else {}
+            anomalous_seg    = flag_anomalous(composite_segregated) if composite_segregated else {}
+            # Merge: boost composite score for runs flagged in either pool
+            for rid in composite:
+                if anomalous_seg.get(rid, False):
+                    composite[rid] = max(composite[rid],
+                                         composite_segregated.get(rid, 0.0))
+
         anomalous  = flag_anomalous(composite)
         anom_set_t = {rid for rid, a in anomalous.items() if a}
-        anom_set_all |= anom_set_t
+        anom_set_all |= {(tool_id, rid) for rid in anom_set_t}
         composite_all_flat.update(composite)
         per_sensor_sc_all[tool_id] = dict(per_sensor_sc)
 
@@ -4668,7 +5476,8 @@ def main():
                     if s not in loo_bl:
                         loo_bl[s] = bl
             loo_baselines[rid] = loo_bl
-            lead, chain, non_div = detect_lead_lag(run_dict_clean[rid], loo_bl, _SENSORS)
+            lead, chain, non_div = detect_lead_lag(run_dict_clean[rid], loo_bl, _SENSORS,
+                                                   mfc_ramp_ivs=mfc_ramp_ivs)
             if lead:
                 lead_lag[rid] = (lead, chain, non_div)
             if composite.get(rid, 0) > best_score:
@@ -4687,7 +5496,7 @@ def main():
         sp_col_names_t = {sp_col for _, sp_col in sp_pairs}
         tool_results[tool_id] = {}
         for rid in run_ids:
-            is_abort = rid in aborted_all
+            is_abort = (tool_id, rid) in aborted_all
             is_anom  = rid in anom_set_t
             sc_val   = composite.get(rid, 0.0)
             lead_str = ""
@@ -4742,17 +5551,71 @@ def main():
     else:
         print("  DATA_QUALITY is flat -- PATH B (fallback) highflier classification")
 
+    # Flat abort set for tool-unaware step functions (run_id strings only).
+    # A run aborted in any tool is excluded from step scoring entirely.
+    aborted_flat = {rid for _, rid in aborted_all}
+
     step_info_si, run_order_si, run_tool_si, _ = score_steps(
         rows, schema["run_col"],
         schema["group_cols"][0] if schema.get("group_cols") else None,
-        schema["step_num_col"], sensor_cols, aborted_all)
+        schema["step_num_col"], sensor_cols, aborted_flat,
+        noisy_sensor_steps=schema.get("noisy_sensor_steps", set()))
 
     top_steps_si   = set(sorted(step_info_si, key=lambda s: -step_info_si[s]["mean_cv"])[:TOP_N_STEPS])
-    all_si_sensors = sorted({s for sn in top_steps_si
-                              for s, *_ in step_info_si[sn]["sensor_cvs"]})
+
+    # Build forced_step_sensors: for every anomalous run, determine which
+    # (step, sensor) pairs are actually anomalous by rescoring per-step.
+    # Only force a sensor into the trend chart for steps where its per-step
+    # anomaly score is genuinely elevated for that specific anomalous run.
+    forced_step_sensors = defaultdict(set)   # { step_number: {sensor, ...} }
+    if schema.get("step_num_col"):
+        for tool_id, rid in anom_set_all:
+            psc      = per_sensor_sc_all.get(tool_id, {}).get(rid, {})
+            baselines= baselines_full_all.get(tool_id, {})
+            rrows_f  = tool_runs.get(tool_id, {}).get(rid, [])
+            if not psc or not rrows_f:
+                continue
+            # Sensors with non-trivial composite score for this anomalous run
+            flagged_sensors_run = {s for s, sc in psc.items() if sc > 0.0}
+            # Collect all scored steps for this run
+            steps_in_run = {str(r.get("_step_number", "")).strip()
+                            for r in rrows_f
+                            if str(r.get("_step_number", "")).strip()
+                            and str(r.get("_step_number", "")).strip() not in SKIP_STEPS}
+            for sn_f in steps_in_run:
+                sf = {sn_f}
+                for s in flagged_sensors_run:
+                    bl = baselines.get(s)
+                    if bl is None:
+                        continue
+                    # Score this sensor for this run restricted to this step
+                    step_sc = compute_run_score(rrows_f, bl, s, step_filter=sf)
+                    if step_sc > 0.0:
+                        forced_step_sensors[sn_f].add(s)
+
+    # Merge forced steps into top_steps_si
+    top_steps_si.update(forced_step_sensors.keys())
+
+    # Collect sensors for all top + forced steps
+    all_si_sensors = sorted(
+        {s for sn in top_steps_si for s, *_ in step_info_si.get(sn, {}).get("sensor_cvs", [])}
+        | {s for sensors in forced_step_sensors.values() for s in sensors}
+    )
+    _tool_col_si = schema["group_cols"][0] if schema.get("group_cols") else None
     run_means_by_step = collect_run_means(
         rows, schema["run_col"], schema["step_num_col"],
-        all_si_sensors, top_steps_si, aborted_all)
+        all_si_sensors, top_steps_si, aborted_flat,
+        tool_col=_tool_col_si)
+
+    # Per-run row-count lookup: ckey is "tool::rid"; look up (tool, rid) in row_counts_all.
+    row_counts_flat = {}
+    for ckey in run_order_si:
+        tool_si = run_tool_si.get(ckey, "ALL")
+        rid_si  = ckey.split("::", 1)[1] if "::" in ckey else ckey
+        row_counts_flat[ckey] = row_counts_all.get((tool_si, rid_si), 0)
+
+    # aborted_flat as composite keys for svg_trend_chart
+    aborted_flat_ckeys = {f"{tool}::{rid}" for tool, rid in aborted_all}
 
     highfliers = detect_highfliers(
         run_means_by_step, run_order_si,
@@ -4769,7 +5632,9 @@ def main():
     print("\nWriting step importance sections (phase 2 complete) ...")
     _write_step_sections(fh, step_info_si, run_order_si, run_tool_si,
                           run_means_by_step, highfliers,
-                          aborted_all, row_counts_all)
+                          aborted_flat_ckeys, row_counts_flat,
+                          forced_step_sensors=forced_step_sensors,
+                          noisy_sensor_steps=schema.get("noisy_sensor_steps", set()))
 
     print(f"\nDone. Full report: {html_out}")
 
